@@ -97,12 +97,12 @@ def main():
         max_num_inp_token_per_rank=64,
         num_experts_per_rank=1,
         num_experts_per_token=1,
-        warp_num_per_block=4,
-        block_num=4,
+        warp_num_per_block=16,
+        block_num=32,
         use_external_inp_buf=True,
         kernel_type=EpDispatchCombineKernelType.InterNodeV1,
         gpu_per_node=world_size,
-        rdma_block_num=1,
+        rdma_block_num=16,
     )
     device_name = kiwi_ep_ext.get_hca_name_for_current_gpu()
     op = AdaptiveEpDispatchCombineOp(
