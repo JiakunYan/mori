@@ -288,6 +288,10 @@ key is `dispatch_input.size(0)`. In vLLM CUDA-graph capture this is the final
 padded token-bucket size, so a captured graph always replays the backend chosen
 while that bucket was captured.
 
+The wrapper also retains the original routing indices from `dispatch()`. This
+keeps MORI inter-node combine correct when a framework such as vLLM passes the
+received-token indices returned by dispatch into its finalize hook.
+
 ```python
 from mori.ops import AdaptiveEpDispatchCombineOp
 

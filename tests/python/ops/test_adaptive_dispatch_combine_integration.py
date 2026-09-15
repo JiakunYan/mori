@@ -44,7 +44,7 @@ def run_pair(op, rank, world_size, num_tokens, hidden_dim, device):
     dispatched, _, _, dispatched_indices, _ = op.dispatch(
         tokens, weights, None, indices
     )
-    combined, _ = op.combine(dispatched, None, indices)
+    combined, _ = op.combine(dispatched, None, dispatched_indices)
     torch.cuda.synchronize()
     torch.testing.assert_close(combined[:num_tokens], tokens, rtol=0, atol=0)
     return dispatched_indices, combined
@@ -56,8 +56,10 @@ def capture_pair(op, rank, world_size, num_tokens, hidden_dim, device):
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        dispatched, _, _, _, _ = op.dispatch(tokens, weights, None, indices)
-        combined, _ = op.combine(dispatched, None, indices)
+        dispatched, _, _, dispatched_indices, _ = op.dispatch(
+            tokens, weights, None, indices
+        )
+        combined, _ = op.combine(dispatched, None, dispatched_indices)
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()

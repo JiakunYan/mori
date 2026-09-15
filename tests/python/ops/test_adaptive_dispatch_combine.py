@@ -19,7 +19,7 @@ class FakeEpOp:
         return (self.name, "dispatch")
 
     def combine(self, input, weights, indices, **kwargs):
-        self.calls.append(("combine", input.size(0), kwargs))
+        self.calls.append(("combine", input.size(0), indices, kwargs))
         return (self.name, "combine")
 
     def reset(self):
@@ -85,6 +85,17 @@ def test_combine_cannot_switch_when_its_shape_crosses_threshold():
     op.dispatch(dispatch_hidden, weights, None, indices)
     assert op.combine(combine_hidden, None, indices) == ("kiwi", "combine")
     assert [call[0] for call in kiwi.calls] == ["dispatch", "combine"]
+
+
+def test_combine_uses_original_dispatch_indices():
+    op, mori, _ = make_op()
+    hidden, weights, original_indices = tensors(64)
+    _, _, received_indices = tensors(128)
+
+    op.dispatch(hidden, weights, None, original_indices)
+    op.combine(hidden, None, received_indices)
+
+    assert mori.calls[-1][2] is original_indices
 
 
 def test_pairing_errors_are_explicit():
