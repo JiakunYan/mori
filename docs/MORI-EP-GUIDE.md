@@ -280,6 +280,36 @@ combine_buf[:recv_num_token, :].copy_(expert_output[:recv_num_token, :])
 
 ---
 
+### Adaptive MORI/Kiwi backend selection
+
+`AdaptiveEpDispatchCombineOp` keeps a MORI operator and a Kiwi operator alive
+and selects one backend for each complete dispatch/combine pair. The selection
+key is `dispatch_input.size(0)`. In vLLM CUDA-graph capture this is the final
+padded token-bucket size, so a captured graph always replays the backend chosen
+while that bucket was captured.
+
+```python
+from mori.ops import AdaptiveEpDispatchCombineOp
+
+op = AdaptiveEpDispatchCombineOp(
+    config,
+    kiwi_max_num_tokens=32,
+    dispatch_dtype=torch.bfloat16,
+    combine_dtype=torch.bfloat16,
+    group_name="mori",
+)
+```
+
+The named PyTorch process group must already be registered and MORI SHMEM must
+already be initialized. The wrapper initializes Kiwi/LCI from the same group
+using LCI's TCP PMI bootstrap. `lci_master_addr` and `lci_master_port` can be
+specified when automatic hostname and free-port selection are unsuitable.
+
+Every rank must use the same padded bucket. Split send/receive, MORI routing
+handles, local-expert counting on Kiwi-selected buckets, capped receive
+allocation, zero-copy combine input, and MORI combine quantization are rejected
+explicitly for the Kiwi path.
+
 ## 4. Standard MoE Compatibility (DeepEP)
 
 MORI-EP provides DeepEP-compatible APIs for frameworks that use standard 3D MoE tensor layouts. These require building with `ENABLE_STANDARD_MOE_ADAPT=ON`:

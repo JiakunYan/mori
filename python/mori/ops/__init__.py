@@ -26,6 +26,10 @@ from .dispatch_combine import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+from .adaptive_dispatch_combine import (
+    AdaptiveEpDispatchCombineOp,
+    initialize_kiwi_lci_from_torch_process_group,
+)
 from .local_expert_count import (
     launch_local_expert_count,
 )
