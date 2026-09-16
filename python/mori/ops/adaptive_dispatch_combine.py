@@ -10,7 +10,7 @@ import os
 import socket
 import threading
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -187,12 +187,14 @@ class AdaptiveEpDispatchCombineOp:
         device_name: str = "",
         lci_master_addr: str | None = None,
         lci_master_port: int | None = None,
+        selection_num_tokens_fn: Callable[[int], int] | None = None,
     ):
         if kiwi_max_num_tokens < 0:
             raise ValueError("kiwi_max_num_tokens must be non-negative")
 
         self.config = config
         self.kiwi_max_num_tokens = int(kiwi_max_num_tokens)
+        self._selection_num_tokens_fn = selection_num_tokens_fn
         self.mori_op = mori_op if mori_op is not None else EpDispatchCombineOp(config)
 
         if kiwi_op is None:
@@ -318,11 +320,18 @@ class AdaptiveEpDispatchCombineOp:
         if self._active_backend is not None:
             raise RuntimeError("dispatch called before the previous combine completed")
 
-        backend = self.backend_for_num_tokens(input.size(0))
+        local_num_tokens = int(input.size(0))
+        selection_num_tokens = (
+            self._selection_num_tokens_fn(local_num_tokens)
+            if self._selection_num_tokens_fn is not None
+            else local_num_tokens
+        )
+        backend = self.backend_for_num_tokens(selection_num_tokens)
         if backend not in self._logged_backends:
             message = (
                 f"Adaptive MORI/Kiwi EP selected backend={backend} "
-                f"num_tokens={input.size(0)} "
+                f"local_num_tokens={local_num_tokens} "
+                f"selection_num_tokens={selection_num_tokens} "
                 f"kiwi_max_num_tokens={self.kiwi_max_num_tokens}"
             )
             logger.info(message)

@@ -39,7 +39,7 @@ class FakeEpOp:
         return 128
 
 
-def make_op(threshold=32):
+def make_op(threshold=32, selection_num_tokens_fn=None):
     mori = FakeEpOp("mori")
     kiwi = FakeEpOp("kiwi")
     op = AdaptiveEpDispatchCombineOp(
@@ -47,6 +47,7 @@ def make_op(threshold=32):
         kiwi_max_num_tokens=threshold,
         mori_op=mori,
         kiwi_op=kiwi,
+        selection_num_tokens_fn=selection_num_tokens_fn,
     )
     return op, mori, kiwi
 
@@ -86,6 +87,19 @@ def test_combine_cannot_switch_when_its_shape_crosses_threshold():
     op.dispatch(dispatch_hidden, weights, None, indices)
     assert op.combine(combine_hidden, None, indices) == ("kiwi", "combine")
     assert [call[0] for call in kiwi.calls] == ["dispatch", "combine"]
+
+
+def test_selection_can_use_global_token_count():
+    op, mori, kiwi = make_op(
+        threshold=32, selection_num_tokens_fn=lambda local: 64
+    )
+    hidden, weights, indices = tensors(1)
+
+    op.dispatch(hidden, weights, None, indices)
+    op.combine(hidden, None, indices)
+
+    assert [call[0] for call in mori.calls] == ["dispatch", "combine"]
+    assert kiwi.calls == []
 
 
 def test_combine_forwards_framework_dispatch_indices():
@@ -174,6 +188,7 @@ def test_public_constructor_enables_adaptive_vllm_path(monkeypatch):
                 "dispatch_dtype": torch.float8_e4m3fnuz,
                 "combine_dtype": torch.bfloat16,
                 "num_blocks": 0,
+                "selection_num_tokens_fn": ops._vllm_global_num_tokens,
             },
         )
     ]

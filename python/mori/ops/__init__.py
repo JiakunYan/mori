@@ -77,6 +77,18 @@ def _vllm_combine_dtype(config):
     return dtype
 
 
+def _vllm_global_num_tokens(local_num_tokens):
+    try:
+        from vllm.forward_context import get_forward_context
+
+        dp_metadata = get_forward_context().dp_metadata
+    except (ImportError, AssertionError):
+        return local_num_tokens
+    if dp_metadata is None:
+        return local_num_tokens
+    return int(dp_metadata.num_tokens_across_dp_cpu.max().item())
+
+
 class EpDispatchCombineOp(_MoriEpDispatchCombineOp):
     """Construct normal MORI, or an opt-in adaptive MORI/Kiwi operator."""
 
@@ -91,6 +103,7 @@ class EpDispatchCombineOp(_MoriEpDispatchCombineOp):
             dispatch_dtype=config.data_type,
             combine_dtype=_vllm_combine_dtype(config),
             num_blocks=0,
+            selection_num_tokens_fn=_vllm_global_num_tokens,
         )
 
 

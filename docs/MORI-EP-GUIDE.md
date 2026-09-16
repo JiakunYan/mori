@@ -312,7 +312,9 @@ up to 16 and MORI for larger buckets. Leaving the variable unset preserves the
 normal MORI operator. The vLLM path defaults its combine dtype to BF16;
 `MORI_EP_KIWI_COMBINE_DTYPE=float32` selects FP32 when the MORI buffer config
 uses four-byte elements. `MORI_EP_KIWI_TRACE=1` prints the first selected Kiwi
-and MORI bucket per process for deployment verification.
+and MORI bucket per process for deployment verification. When vLLM exposes
+per-rank token counts through its forward context, selection uses their global
+maximum so every expert-parallel rank enters the same transport.
 
 The named PyTorch process group must already be registered and MORI SHMEM must
 already be initialized. The wrapper initializes Kiwi/LCI from the same group
