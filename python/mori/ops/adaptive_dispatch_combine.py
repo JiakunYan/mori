@@ -224,7 +224,6 @@ class AdaptiveEpDispatchCombineOp:
             )
         self.kiwi_op = kiwi_op
         self._active_backend: str | None = None
-        self._active_indices = None
         self._last_backend: str | None = None
         self._logged_backends: set[str] = set()
         self._validate_capacities()
@@ -331,7 +330,6 @@ class AdaptiveEpDispatchCombineOp:
                 print(message, flush=True)
             self._logged_backends.add(backend)
         self._active_backend = backend
-        self._active_indices = indices
         try:
             if backend == "kiwi":
                 if call_local_expert_count:
@@ -365,7 +363,6 @@ class AdaptiveEpDispatchCombineOp:
             )
         except Exception:
             self._active_backend = None
-            self._active_indices = None
             raise
 
     def combine(
@@ -384,7 +381,6 @@ class AdaptiveEpDispatchCombineOp:
         backend = self._active_backend
         if backend is None:
             raise RuntimeError("combine requires a preceding adaptive dispatch")
-        dispatch_indices = self._active_indices
         try:
             if backend == "kiwi":
                 if routing is not None:
@@ -394,7 +390,7 @@ class AdaptiveEpDispatchCombineOp:
                 return self.kiwi_op.combine(
                     input,
                     weights,
-                    dispatch_indices,
+                    indices,
                     block_num=block_num,
                     rdma_block_num=rdma_block_num,
                     warp_per_block=warp_per_block,
@@ -404,7 +400,7 @@ class AdaptiveEpDispatchCombineOp:
             return self.mori_op.combine(
                 input,
                 weights,
-                dispatch_indices,
+                indices,
                 block_num=block_num,
                 rdma_block_num=rdma_block_num,
                 warp_per_block=warp_per_block,
@@ -415,7 +411,6 @@ class AdaptiveEpDispatchCombineOp:
         finally:
             self._last_backend = backend
             self._active_backend = None
-            self._active_indices = None
 
     def dispatch_send(self, *args, **kwargs):
         raise NotImplementedError(
@@ -441,7 +436,6 @@ class AdaptiveEpDispatchCombineOp:
         self.mori_op.reset()
         self.kiwi_op.reset()
         self._active_backend = None
-        self._active_indices = None
         self._last_backend = None
 
     @property

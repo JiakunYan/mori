@@ -88,7 +88,7 @@ def test_combine_cannot_switch_when_its_shape_crosses_threshold():
     assert [call[0] for call in kiwi.calls] == ["dispatch", "combine"]
 
 
-def test_combine_uses_original_dispatch_indices():
+def test_combine_forwards_framework_dispatch_indices():
     op, mori, _ = make_op()
     hidden, weights, original_indices = tensors(64)
     _, _, received_indices = tensors(128)
@@ -96,7 +96,7 @@ def test_combine_uses_original_dispatch_indices():
     op.dispatch(hidden, weights, None, original_indices)
     op.combine(hidden, None, received_indices)
 
-    assert mori.calls[-1][2] is original_indices
+    assert mori.calls[-1][2] is received_indices
 
 
 def test_pairing_errors_are_explicit():
