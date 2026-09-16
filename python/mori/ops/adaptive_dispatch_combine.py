@@ -321,13 +321,14 @@ class AdaptiveEpDispatchCombineOp:
 
         backend = self.backend_for_num_tokens(input.size(0))
         if backend not in self._logged_backends:
-            logger.info(
-                "Adaptive MORI/Kiwi EP selected backend=%s num_tokens=%d "
-                "kiwi_max_num_tokens=%d",
-                backend,
-                input.size(0),
-                self.kiwi_max_num_tokens,
+            message = (
+                f"Adaptive MORI/Kiwi EP selected backend={backend} "
+                f"num_tokens={input.size(0)} "
+                f"kiwi_max_num_tokens={self.kiwi_max_num_tokens}"
             )
+            logger.info(message)
+            if os.environ.get("MORI_EP_KIWI_TRACE") == "1":
+                print(message, flush=True)
             self._logged_backends.add(backend)
         self._active_backend = backend
         self._active_indices = indices
