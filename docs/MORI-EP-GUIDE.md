@@ -304,6 +304,15 @@ op = AdaptiveEpDispatchCombineOp(
 )
 ```
 
+vLLM can opt into the wrapper without changing its MORI integration. Set
+`MORI_EP_KIWI_MAX_TOKENS` before starting vLLM; its existing
+`mori.ops.EpDispatchCombineOp(config)` construction then creates the adaptive
+operator. For example, `MORI_EP_KIWI_MAX_TOKENS=16` uses Kiwi for token buckets
+up to 16 and MORI for larger buckets. Leaving the variable unset preserves the
+normal MORI operator. The vLLM path defaults its combine dtype to BF16;
+`MORI_EP_KIWI_COMBINE_DTYPE=float32` selects FP32 when the MORI buffer config
+uses four-byte elements.
+
 The named PyTorch process group must already be registered and MORI SHMEM must
 already be initialized. The wrapper initializes Kiwi/LCI from the same group
 using LCI's TCP PMI bootstrap. `lci_master_addr` and `lci_master_port` can be

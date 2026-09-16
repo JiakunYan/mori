@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
@@ -16,9 +17,30 @@ import torch.distributed as dist
 
 from .dispatch_combine import EpDispatchCombineOp
 
+logger = logging.getLogger(__name__)
+
 _KIWI_CONTEXT = None
 _KIWI_CONTEXT_KEY = None
 _KIWI_CONTEXT_LOCK = threading.Lock()
+
+
+def _load_kiwi_extension():
+    """Load Kiwi EP, accepting its pre-rename GLCI module name."""
+
+    try:
+        import kiwi_ep_ext
+
+        return kiwi_ep_ext, kiwi_ep_ext.KiwiEpOp
+    except ImportError as kiwi_error:
+        try:
+            import glci_ep_ext
+
+            return glci_ep_ext, glci_ep_ext.GlciEpOp
+        except ImportError:
+            raise RuntimeError(
+                "adaptive MORI/Kiwi EP requires an importable kiwi_ep_ext "
+                "(or legacy glci_ep_ext)"
+            ) from kiwi_error
 
 
 def _resolve_process_group(group_name: str):
@@ -108,12 +130,12 @@ def initialize_kiwi_lci_from_torch_process_group(
 
         addr, port = _root_rendezvous(group, master_addr, master_port)
 
-        try:
-            import kiwi_ep_ext
-        except ImportError as exc:
-            raise RuntimeError(
-                "adaptive MORI/Kiwi EP requires an importable kiwi_ep_ext"
-            ) from exc
+        kiwi_ep_ext, _ = _load_kiwi_extension()
+
+        if not device_name:
+            get_hca = getattr(kiwi_ep_ext, "get_hca_name_for_current_gpu", None)
+            if get_hca is not None:
+                device_name = str(get_hca())
 
         env = {
             "LCT_PMI_BACKEND": "tcp",
@@ -179,6 +201,13 @@ class AdaptiveEpDispatchCombineOp:
                     "dispatch_dtype and combine_dtype are required when kiwi_op "
                     "is not supplied"
                 )
+            if not device_name:
+                kiwi_ep_ext, _ = _load_kiwi_extension()
+                get_hca = getattr(
+                    kiwi_ep_ext, "get_hca_name_for_current_gpu", None
+                )
+                if get_hca is not None:
+                    device_name = str(get_hca())
             initialize_kiwi_lci_from_torch_process_group(
                 group_name,
                 master_addr=lci_master_addr,
@@ -197,6 +226,7 @@ class AdaptiveEpDispatchCombineOp:
         self._active_backend: str | None = None
         self._active_indices = None
         self._last_backend: str | None = None
+        self._logged_backends: set[str] = set()
         self._validate_capacities()
 
     def _create_kiwi_op(
@@ -208,7 +238,7 @@ class AdaptiveEpDispatchCombineOp:
         queue_capacity,
         device_name,
     ):
-        import kiwi_ep_ext
+        _, kiwi_op_type = _load_kiwi_extension()
 
         if self.config.max_total_recv_tokens:
             raise NotImplementedError(
@@ -234,7 +264,7 @@ class AdaptiveEpDispatchCombineOp:
         if self.config.scale_dim and self.config.scale_type_size == 1:
             scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
-        return kiwi_ep_ext.KiwiEpOp(
+        return kiwi_op_type(
             device_id=torch.cuda.current_device(),
             world_size=self.config.world_size,
             hidden_dim=self.config.hidden_dim,
@@ -290,6 +320,15 @@ class AdaptiveEpDispatchCombineOp:
             raise RuntimeError("dispatch called before the previous combine completed")
 
         backend = self.backend_for_num_tokens(input.size(0))
+        if backend not in self._logged_backends:
+            logger.info(
+                "Adaptive MORI/Kiwi EP selected backend=%s num_tokens=%d "
+                "kiwi_max_num_tokens=%d",
+                backend,
+                input.size(0),
+                self.kiwi_max_num_tokens,
+            )
+            self._logged_backends.add(backend)
         self._active_backend = backend
         self._active_indices = indices
         try:

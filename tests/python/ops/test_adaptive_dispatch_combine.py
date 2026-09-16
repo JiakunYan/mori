@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import mori.ops as ops
 from mori.ops import AdaptiveEpDispatchCombineOp
 
 
@@ -137,3 +138,50 @@ def test_capacity_mismatch_is_rejected():
             mori_op=mori,
             kiwi_op=kiwi,
         )
+
+
+def test_public_constructor_preserves_normal_mori_default(monkeypatch):
+    monkeypatch.delenv("MORI_EP_KIWI_MAX_TOKENS", raising=False)
+
+    assert issubclass(ops.EpDispatchCombineOp, ops._MoriEpDispatchCombineOp)
+
+
+def test_public_constructor_enables_adaptive_vllm_path(monkeypatch):
+    config = SimpleNamespace(
+        data_type=torch.float8_e4m3fnuz,
+        max_token_type_size=2,
+    )
+    mori = object()
+    adaptive = object()
+    calls = []
+
+    monkeypatch.setenv("MORI_EP_KIWI_MAX_TOKENS", "16")
+    monkeypatch.setattr(ops, "_MoriEpDispatchCombineOp", lambda value: mori)
+
+    def make_adaptive(value, **kwargs):
+        calls.append((value, kwargs))
+        return adaptive
+
+    monkeypatch.setattr(ops, "AdaptiveEpDispatchCombineOp", make_adaptive)
+
+    assert ops.EpDispatchCombineOp(config) is adaptive
+    assert calls == [
+        (
+            config,
+            {
+                "kiwi_max_num_tokens": 16,
+                "mori_op": mori,
+                "dispatch_dtype": torch.float8_e4m3fnuz,
+                "combine_dtype": torch.bfloat16,
+                "num_blocks": 0,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("value", ("-1", "not-an-integer"))
+def test_public_constructor_rejects_invalid_threshold(monkeypatch, value):
+    monkeypatch.setenv("MORI_EP_KIWI_MAX_TOKENS", value)
+
+    with pytest.raises(RuntimeError, match="non-negative integer"):
+        ops.EpDispatchCombineOp(SimpleNamespace())
