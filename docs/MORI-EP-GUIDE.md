@@ -285,10 +285,10 @@ combine_buf[:recv_num_token, :].copy_(expert_output[:recv_num_token, :])
 `AdaptiveEpDispatchCombineOp` keeps a MORI operator and a Kiwi operator alive
 and selects one backend for each complete dispatch/combine pair. The selection
 key defaults to `dispatch_input.size(0)`. Callers may provide
-`selection_num_tokens_fn` to derive a rank-consistent selection count. The
-environment-enabled vLLM path uses the maximum token count across DP ranks from
-vLLM's forward context. CUDA-graph capture records the selected backend in each
-captured graph.
+`selection_num_tokens_fn` to derive a rank-consistent selection count. For
+example, when used with vLLM, the wrapper uses the maximum token count across DP
+ranks reported by vLLM's forward context. CUDA-graph capture records the
+selected backend in each captured graph.
 
 The wrapper forwards the indices supplied to `combine()`. In vLLM these are
 the received-token indices returned by `dispatch()`, matching both native MORI
