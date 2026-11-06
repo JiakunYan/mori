@@ -124,8 +124,8 @@ std::string DescribeQpTransition(const char* transition, const ibv_qp_attr& attr
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      IBVerbsDeviceContext                                      */
 /* ---------------------------------------------------------------------------------------------- */
-IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd)
-    : RdmaDeviceContext(rdma_device, inPd) {}
+IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd, bool ownsPd)
+    : RdmaDeviceContext(rdma_device, inPd, ownsPd) {}
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   std::lock_guard<std::mutex> lock(poolMu);

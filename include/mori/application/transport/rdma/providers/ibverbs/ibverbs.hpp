@@ -31,7 +31,7 @@ namespace application {
 
 class IBVerbsDeviceContext : public RdmaDeviceContext {
  public:
-  IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
+  IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd, bool ownsPd = true);
   ~IBVerbsDeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
