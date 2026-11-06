@@ -374,6 +374,37 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
+// ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels push
+// descriptors, with keys already resolved (the same iova=0 window addressing as
+// GDA), into KIWI device-to-host queues. A fixed set of host proxy threads
+// polls the queues and posts the RDMA work requests on host-created RC QPs, one
+// per (proxy thread, peer). Two queue pools: SPSC (one wavefront at a time per
+// queue) and MPSC. Empty when both pools are empty.
+//
+// ccoProxyQueueRaw holds one queue's device-visible state; it mirrors the KIWI
+// DeviceHandle so this header stays free of KIWI headers (cco_proxy.hpp
+// rebuilds the handle on the device).
+struct ccoProxyQueueRaw {
+  void* chunks;                   // ring, host memory
+  const uint64_t* consumerIndex;  // published consumer line, host memory
+  // MPSC: the shared claim index. SPSC: the persisted producer state
+  // {producer_index, consumer_index_cached}, loaded by ccoProxy's constructor
+  // and written back by its destructor / release(). Device memory.
+  uint64_t* producerState;
+  // Queue position (lines) just past the last FLUSH the proxy has satisfied.
+  // Fine-grained device memory, written only by the proxy, never decreases.
+  uint64_t* flushDone;
+  uint32_t log2Capacity;  // log2(capacity in 64-byte lines)
+};
+
+struct ccoProxyContext {
+  int numSpscQueues;
+  int numMpscQueues;
+  ccoProxyQueueRaw* spscQueues;  // GPU [numSpscQueues]
+  ccoProxyQueueRaw* mpscQueues;  // GPU [numMpscQueues]
+  void* engine;                  // host-only ccoProxyEngine*, opaque to kernels
+};
+
 struct ccoDevComm {
   // World / topology
   int rank;
@@ -413,6 +444,8 @@ struct ccoDevComm {
   ccoGdaBarrierHandle hybridRailGdaBarrier;
   // SDMA context (signal pool); empty when SDMA not materialized.
   ccoSdmaContext sdma;
+  // ccoProxy context (host-proxy RDMA); empty when no proxy queues are requested.
+  ccoProxyContext proxy;
 };
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
@@ -487,6 +520,15 @@ struct ccoDevCommRequirements {
   // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
+
+  // ccoProxy (host-proxy RDMA, needs a BUILD_CCO_PROXY build). Separate SPSC and
+  // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
+  // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
+  // signal slots, so gdaConnectionType must resolve to non-NONE.
+  int proxySpscQueueCount;  // 0 = no SPSC pool
+  int proxyMpscQueueCount;  // 0 = no MPSC pool
+  int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
+  int proxyQueueCapacity;   // ring capacity in 64-byte lines (power of two); 0 = default
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -505,6 +547,10 @@ struct ccoDevCommRequirements {
       0,                                         /* railGdaBarrierCount*/       \
       0,                                         /* sdmaQueueCount     */       \
       0,                                         /* barrierCount       */       \
+      0,                                         /* proxySpscQueueCount*/       \
+      0,                                         /* proxyMpscQueueCount*/       \
+      0,                                         /* proxyThreadCount   */       \
+      0,                                         /* proxyQueueCapacity */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -993,7 +1039,8 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // outDevComm is a caller-provided host struct filled in place (it holds device
 // pointers but lives on the host). Pass it by value into kernels — it lands in
 // kernel-arg space, no per-access GPU-memory dereference. The device resources
-// it references are released by ccoDevCommDestroy(comm, &devComm).
+// it references are released by ccoDevCommDestroy(comm, &devComm), which is
+// collective when the DevComm has ccoProxy queues.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 

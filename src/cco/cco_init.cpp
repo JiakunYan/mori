@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,9 @@
 #endif
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
+#ifdef MORI_CCO_PROXY
+#include "cco_proxy_engine.hpp"
+#endif
 
 namespace mori {
 namespace cco {
@@ -1875,6 +1879,47 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
   hostShadow.resourceWindow = resourceWindow;
 
+  // ccoProxy: proxy threads + host-posted QPs to the GDA peer set, sharing the
+  // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
+  // when the caller's struct has them.
+  const bool reqsHaveProxy =
+      reqs->size >= offsetof(ccoDevCommRequirements, proxyQueueCapacity) + sizeof(int);
+  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
+  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
+  if (proxySpsc + proxyMpsc > 0) {
+    const char* proxyError = nullptr;
+#ifdef MORI_CCO_PROXY
+    if (connType == CCO_GDA_CONNECTION_NONE || !comm->ctx->RdmaTransportEnabled()) {
+      proxyError =
+          "ccoProxy queues need RDMA and a gdaConnectionType that resolves to non-NONE "
+          "(ccoProxy uses the GDA peer set and signal slots)";
+    } else {
+      ccoProxyEngineConfig proxyConfig;
+      proxyConfig.numSpscQueues = proxySpsc;
+      proxyConfig.numMpscQueues = proxyMpsc;
+      proxyConfig.numThreads = std::max(reqs->proxyThreadCount, 0);
+      proxyConfig.queueCapacity =
+          reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
+      proxyConfig.peerMask = peerMask;
+      if (ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy) ==
+          nullptr) {
+        proxyError = "ccoProxy engine creation failed";
+      }
+    }
+#else
+    proxyError = "ccoProxy queues requested but mori was built without BUILD_CCO_PROXY";
+#endif
+    if (proxyError != nullptr) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: {}", proxyError);
+      if (resourceWindow) {
+        (void)ccoWindowDeregister(comm, resourceWindow);
+        (void)ccoMemFree(comm, resourceWindowPtr);
+      }
+      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      return -1;
+    }
+  }
+
   // GDA barrier handles point into ibgda.signalBuf; no resource-window bytes
   // consumed. Disabled handles stay {0,0}.
   if (railGdaBarrierCount > 0) {
@@ -2101,6 +2146,14 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // devComm is the caller's host struct (filled by ccoDevCommCreate); read its
   // device-pointer fields directly to release the resources they reference.
   ccoDevComm& hostShadow = *devComm;
+
+  // ccoProxy first: its threads post against the windows, MRs and QPs freed below.
+#ifdef MORI_CCO_PROXY
+  if (hostShadow.proxy.engine) {
+    ccoProxyEngineDestroy(static_cast<ccoProxyEngine*>(hostShadow.proxy.engine));
+  }
+#endif
+  hostShadow.proxy = {};
 
   auto& ibgda = hostShadow.ibgda;
 

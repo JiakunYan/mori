@@ -697,6 +697,7 @@ class CMakeBuild(build_ext):
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_cco_proxy_enabled = _env_flag("BUILD_CCO_PROXY", "OFF")
         with_mpi = (
             "ON"
             if (
@@ -758,6 +759,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DBUILD_CCO_PROXY={'ON' if build_cco_proxy_enabled else 'OFF'}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
