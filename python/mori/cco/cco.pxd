@@ -80,18 +80,12 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         uint64_t* signalBuf
         uint64_t** peerSignalPtrs
 
-    cdef struct ccoProxyQueueRaw:
-        void* chunks
-        const uint64_t* consumerIndex
-        uint64_t* producerState
-        uint64_t* flushDone
-        uint32_t log2Capacity
-
     cdef struct ccoProxyContext:
         int numSpscQueues
         int numMpscQueues
-        ccoProxyQueueRaw* spscQueues
-        ccoProxyQueueRaw* mpscQueues
+        void* spscContext
+        void* mpscContext
+        uint64_t* flushDone
         void* engine
 
     cdef struct ccoDevCommRequirements:

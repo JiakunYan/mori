@@ -25,9 +25,11 @@
 //
 // A fixed set of proxy threads. Each owns a subset of the KIWI device-to-host
 // queues (SPSC and MPSC; it is their only consumer) and one host-posted RC QP,
-// with its own CQ, per peer. The QPs live on the PD of the comm's RDMA device
-// context, which owns the cco window MRs, so the lkeys/rkeys kernels resolve
-// from ccoWindowDevice are valid on them as-is.
+// with its own CQ, per peer. Each queue pool is one KIWI invoke context: a
+// thread drains its queues with Context::progress(), which runs one registered
+// callback (ProxyWorker::On*) per descriptor on that thread. The QPs live on
+// the PD of the comm's RDMA device context, which owns the cco window MRs, so
+// the lkeys/rkeys kernels resolve from ccoWindowDevice are valid on them as-is.
 //
 // Per-QP work-request sequence numbers: the k-th WR posted on a QP has wr_id k.
 // RC completes WRs in order, so a CQE for WR k retires every WR <= k
@@ -48,6 +50,7 @@
 // clang-format off
 #include "cco_proxy_engine.hpp"
 #include "hip/hip_runtime.h"
+#include "kiwi/invoke/invoke.hpp"
 #include "mori/application/bootstrap/base_bootstrap.hpp"
 #include "mori/application/context/context.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
@@ -66,6 +69,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -81,7 +85,7 @@ namespace {
 constexpr size_t kDefaultQueueCapacity = 4096;  // lines (256 KiB ring per queue)
 constexpr int kDefaultMaxThreads = 4;
 constexpr uint32_t kSqDepth = 512;  // WRs per QP
-constexpr int kPopBatch = 64;       // descriptors popped per queue per pass
+constexpr int kPopBatch = 64;       // callbacks run per queue per pass
 constexpr int kCqPollBatch = 32;
 constexpr size_t kScratchStride = 64;  // per-thread atomic fetch-result slot
 
@@ -184,39 +188,30 @@ void HipOrThrow(hipError_t err, const char* what) {
   }
 }
 
-// Host side of one KIWI device-to-host queue, independent of its producer type.
+// Host side of one KIWI invoke endpoint (one queue), independent of its
+// producer type.
 class HostQueue {
  public:
   virtual ~HostQueue() = default;
-  virtual bool Ready() = 0;  // hint: the next message has started to arrive
-  virtual bool Pop(void* buf, uint32_t* meta, size_t* bytes) = 0;
-  virtual ccoProxyQueueRaw Raw() = 0;  // chunks / consumerIndex / log2Capacity (+ MPSC index)
+  virtual bool Ready() = 0;            // hint: the next message has started to arrive
+  virtual size_t Progress(int max) = 0;  // runs up to `max` callbacks; returns how many
 };
 
 template <typename Q>
 class HostQueueImpl final : public HostQueue {
  public:
-  explicit HostQueueImpl(size_t capacity) : queue_(capacity), poll_(queue_.host_poll_state()) {}
+  HostQueueImpl(kiwi::invoke::Context<Q>& ctx, size_t endpoint)
+      : ctx_(ctx), endpoint_(endpoint), poll_(ctx.raw_queue(endpoint)->host_poll_state()) {}
   bool Ready() override { return poll_.ready(); }
-  bool Pop(void* buf, uint32_t* meta, size_t* bytes) override {
-    if (!queue_.pop(buf, meta, bytes)) return false;
-    poll_.refresh();
-    return true;
-  }
-  ccoProxyQueueRaw Raw() override {
-    const typename Q::DeviceHandle h = queue_.device_handle();
-    ccoProxyQueueRaw raw{};
-    raw.chunks = (void*)h.chunks;
-    raw.consumerIndex = (const uint64_t*)h.consumer_index;
-    if constexpr (std::is_same_v<Q, kiwi::queue::MPSCD2HQueue>) {
-      raw.producerState = (uint64_t*)h.producer_index;
-    }
-    raw.log2Capacity = h.log2_capacity;
-    return raw;
+  size_t Progress(int max) override {
+    const size_t n = ctx_.progress(endpoint_, max);
+    if (n > 0) poll_.refresh();
+    return n;
   }
 
  private:
-  Q queue_;
+  kiwi::invoke::Context<Q>& ctx_;
+  size_t endpoint_;
   typename Q::HostPollState poll_;
 };
 
@@ -227,7 +222,7 @@ struct PendingFlush {
 
 struct OwnedQueue {
   std::unique_ptr<HostQueue> queue;
-  volatile uint64_t* flushDone{nullptr};  // fine-grained device memory, host-written
+  volatile uint64_t* flushDone{nullptr};  // SPSC: fine-grained device memory, host-written
   uint64_t pos{0};                        // lines consumed (KIWI messages never pad)
   std::vector<uint64_t> lastSeq;          // [worldSize] seq of the last WR this queue produced
   std::deque<PendingFlush> pending;
@@ -258,12 +253,27 @@ class ProxyWorker {
     }
     thread_ = std::thread([this, cpu, stop] {
       PinCallingThread(id_, cpu);
-      Run(stop);
+      current_ = this;
+      try {
+        Run(stop);
+      } catch (const std::exception& e) {  // e.g. KIWI invoke: unknown callback, bad size
+        ProxyFatal(id_, e.what());
+      }
     });
   }
 
   void Join() {
     if (thread_.joinable()) thread_.join();
+  }
+
+  // Registers the ccoProxyOp callbacks on a pool's invoke context, in op order
+  // so the callback ids are the ops.
+  template <typename Q>
+  static void RegisterCallbacks(kiwi::invoke::Context<Q>& ctx) {
+    Register(ctx, ccoProxyOpPut, &ProxyWorker::OnPut);
+    Register(ctx, ccoProxyOpPutSignal, &ProxyWorker::OnPutSignal);
+    Register(ctx, ccoProxyOpSignal, &ProxyWorker::OnSignal);
+    Register(ctx, ccoProxyOpFlush, &ProxyWorker::OnFlush);
   }
 
   std::vector<ProxyQp> qps;         // [worldSize]; active for masked peers
@@ -272,19 +282,27 @@ class ProxyWorker {
   uint32_t scratchLkey{0};
 
  private:
+  // A callback runs on the proxy thread that called progress(), for the queue
+  // in its cur_. Before the callback proper, it advances that queue's position
+  // past its message (KIWI messages never pad).
+  template <typename Q, typename Desc>
+  static void Register(kiwi::invoke::Context<Q>& ctx, ccoProxyOp op,
+                       void (ProxyWorker::*fn)(const Desc&)) {
+    const uint8_t id = ctx.register_callback(std::function<void(Desc)>([fn](Desc d) {
+      ProxyWorker* w = current_;
+      w->cur_->pos += kiwi::queue::message_lines(sizeof(Desc));
+      (w->*fn)(d);
+    }));
+    if (id != op) throw std::runtime_error("ccoProxy callback id mismatch");
+  }
+
   void Run(const std::atomic<bool>* stop) {
-    alignas(16) unsigned char msg[kiwi::queue::kMaxMessageBytes];
     for (;;) {
-      int popped = 0;
+      size_t popped = 0;
       for (OwnedQueue* oq : queues) {
-        for (int n = 0; n < kPopBatch && oq->queue->Ready(); n++) {
-          uint32_t meta = 0;
-          size_t bytes = 0;
-          if (!oq->queue->Pop(msg, &meta, &bytes)) break;
-          oq->pos += kiwi::queue::message_lines(bytes);
-          Handle(*oq, meta, msg, bytes);
-          popped++;
-        }
+        if (!oq->queue->Ready()) continue;
+        cur_ = oq;
+        popped += oq->queue->Progress(kPopBatch);
       }
       bool inFlight = false;
       bool completed = false;
@@ -319,70 +337,49 @@ class ProxyWorker {
     return false;
   }
 
-  template <typename Desc>
-  Desc Load(const void* msg, size_t bytes, const char* name) {
-    if (bytes != sizeof(Desc)) {
-      ProxyFatal(id_, std::string("bad ") + name + " descriptor size " + std::to_string(bytes));
-    }
-    Desc d;
-    std::memcpy(&d, msg, sizeof(Desc));
-    return d;
-  }
-
-  ProxyQp& PeerQp(int peer) {
-    if (peer < 0 || peer >= static_cast<int>(qps.size()) || !qps[peer].active) {
+  ProxyQp& PeerQp(uint32_t peer) {
+    if (peer >= qps.size() || !qps[peer].active) {
       ProxyFatal(id_, "descriptor for peer " + std::to_string(peer) +
                           " without a proxy QP (check gdaConnectionType)");
     }
     return qps[peer];
   }
 
-  void Handle(OwnedQueue& oq, uint32_t meta, const void* msg, size_t bytes) {
-    const uint32_t op = ccoProxyMetaOp(meta);
-    const int peer = ccoProxyMetaPeer(meta);
-    switch (op) {
-      case ccoProxyOpPut: {
-        const auto d = Load<ccoProxyPutDesc>(msg, bytes, "put");
-        ProxyQp& qp = PeerQp(peer);
-        Reserve(qp, 1);
-        oq.lastSeq[peer] = AddWrite(qp, d);
-        break;
+  void OnPut(const ccoProxyPutDesc& d) {
+    ProxyQp& qp = PeerQp(d.peer);
+    Reserve(qp, 1);
+    cur_->lastSeq[d.peer] = AddWrite(qp, d);
+  }
+
+  void OnPutSignal(const ccoProxyPutSignalDesc& d) {
+    ProxyQp& qp = PeerQp(d.put.peer);
+    Reserve(qp, 2);  // both in one chain: data, then the atomic, on the same QP
+    AddWrite(qp, d.put);
+    cur_->lastSeq[d.put.peer] = AddAtomic(qp, d.signal);
+  }
+
+  void OnSignal(const ccoProxySignalDesc& d) {
+    ProxyQp& qp = PeerQp(d.peer);
+    Reserve(qp, 1);
+    cur_->lastSeq[d.peer] = AddAtomic(qp, d);
+  }
+
+  void OnFlush(const ccoProxyFlushDesc& d) {
+    OwnedQueue& oq = *cur_;
+    if (oq.flushDone == nullptr) ProxyFatal(id_, "FLUSH on an MPSC queue");
+    // Everything before the FLUSH is popped; post it too, so even a kiwi
+    // FLUSH means "handed to the NIC".
+    for (int p : activePeers_) PostChain(qps[p]);
+    PendingFlush f{oq.pos, {}};
+    if (d.mode == ccoProxyFlushNetwork) {
+      for (int p : activePeers_) {
+        if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
       }
-      case ccoProxyOpPutSignal: {
-        const auto d = Load<ccoProxyPutSignalDesc>(msg, bytes, "put+signal");
-        ProxyQp& qp = PeerQp(peer);
-        Reserve(qp, 2);  // both in one chain: data, then the atomic, on the same QP
-        AddWrite(qp, d.put);
-        oq.lastSeq[peer] = AddAtomic(qp, d.signal);
-        break;
-      }
-      case ccoProxyOpSignal: {
-        const auto d = Load<ccoProxySignalDesc>(msg, bytes, "signal");
-        ProxyQp& qp = PeerQp(peer);
-        Reserve(qp, 1);
-        oq.lastSeq[peer] = AddAtomic(qp, d);
-        break;
-      }
-      case ccoProxyOpFlush: {
-        const auto d = Load<ccoProxyFlushDesc>(msg, bytes, "flush");
-        // Everything before the FLUSH is popped; post it too, so even a kiwi
-        // FLUSH means "handed to the NIC".
-        for (int p : activePeers_) PostChain(qps[p]);
-        PendingFlush f{oq.pos, {}};
-        if (d.mode == ccoProxyFlushNetwork) {
-          for (int p : activePeers_) {
-            if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
-          }
-        } else if (d.mode != ccoProxyFlushKiwi) {
-          ProxyFatal(id_, "unknown flush mode " + std::to_string(d.mode));
-        }
-        oq.pending.push_back(std::move(f));
-        RetireFlushes(oq);
-        break;
-      }
-      default:
-        ProxyFatal(id_, "unknown descriptor op " + std::to_string(op));
+    } else if (d.mode != ccoProxyFlushKiwi) {
+      ProxyFatal(id_, "unknown flush mode " + std::to_string(d.mode));
     }
+    oq.pending.push_back(std::move(f));
+    RetireFlushes(oq);
   }
 
   // Retire satisfied flushes in FIFO order and publish the newest position.
@@ -483,7 +480,10 @@ class ProxyWorker {
     return n > 0;
   }
 
+  static inline thread_local ProxyWorker* current_ = nullptr;  // set on each proxy thread
+
   int id_;
+  OwnedQueue* cur_{nullptr};  // queue whose callbacks are running
   std::vector<int> activePeers_;
   std::thread thread_;
 };
@@ -502,11 +502,11 @@ class ccoProxyEngine {
       }
     }
     workers.clear();
-    queues.clear();  // frees the KIWI queues
-    ibv.reset();     // deregisters the scratch MR; leaves the borrowed PD alone
+    queues.clear();
+    spsc.reset();  // frees the KIWI queues
+    mpsc.reset();
+    ibv.reset();  // deregisters the scratch MR; leaves the borrowed PD alone
     free(scratch);
-    if (rawGpu) (void)hipFree(rawGpu);
-    if (spscState) (void)hipFree(spscState);
     if (flushDone) (void)hipFree(flushDone);
   }
 
@@ -517,12 +517,12 @@ class ccoProxyEngine {
 
   application::BootstrapNetwork* bootNet{nullptr};
   std::unique_ptr<application::IBVerbsDeviceContext> ibv;
+  std::unique_ptr<kiwi::invoke::Context<kiwi::queue::SPSCD2HQueue>> spsc;  // SPSC pool
+  std::unique_ptr<kiwi::invoke::Context<kiwi::queue::MPSCD2HQueue>> mpsc;  // MPSC pool
   std::vector<std::unique_ptr<OwnedQueue>> queues;  // SPSC pool, then MPSC pool
   std::vector<std::unique_ptr<ProxyWorker>> workers;
   void* scratch{nullptr};
-  ccoProxyQueueRaw* rawGpu{nullptr};  // [numSpsc + numMpsc]
-  uint64_t* spscState{nullptr};       // device [numSpsc * 2]
-  uint64_t* flushDone{nullptr};       // fine-grained device [numSpsc + numMpsc]
+  uint64_t* flushDone{nullptr};  // fine-grained device [numSpsc]
   std::atomic<bool> stop{false};
 };
 
@@ -581,40 +581,41 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       engine->workers.push_back(std::move(w));
     }
 
-    // Device memory: SPSC producer state (device) and flushDone (fine-grained
-    // device memory: the GPU polls it locally, the proxy writes it over PCIe).
+    // SPSC flushDone: fine-grained device memory (the GPU polls it locally, the
+    // proxy writes it over PCIe).
     if (numSpsc > 0) {
-      HipOrThrow(hipMalloc(&engine->spscState, sizeof(uint64_t) * 2 * numSpsc), "hipMalloc");
-      HipOrThrow(hipMemset(engine->spscState, 0, sizeof(uint64_t) * 2 * numSpsc), "hipMemset");
+      HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
+                                       sizeof(uint64_t) * numSpsc, hipDeviceMallocFinegrained),
+                 "hipExtMallocWithFlags");
+      HipOrThrow(hipMemset(engine->flushDone, 0, sizeof(uint64_t) * numSpsc), "hipMemset");
+      HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
     }
-    HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
-                                     sizeof(uint64_t) * numQueues, hipDeviceMallocFinegrained),
-               "hipExtMallocWithFlags");
-    HipOrThrow(hipMemset(engine->flushDone, 0, sizeof(uint64_t) * numQueues), "hipMemset");
-    HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
 
-    // Queues: SPSC pool [0, numSpsc), MPSC pool [numSpsc, numQueues); queue g
-    // is consumed by thread g % numThreads.
-    std::vector<ccoProxyQueueRaw> raws(numQueues);
+    // One invoke context per pool. Queues: SPSC pool [0, numSpsc), MPSC pool
+    // [numSpsc, numQueues); queue g is consumed by thread g % numThreads.
+    if (numSpsc > 0) {
+      engine->spsc =
+          std::make_unique<kiwi::invoke::Context<kiwi::queue::SPSCD2HQueue>>(numSpsc, capacity);
+      ProxyWorker::RegisterCallbacks(*engine->spsc);
+    }
+    if (numMpsc > 0) {
+      engine->mpsc =
+          std::make_unique<kiwi::invoke::Context<kiwi::queue::MPSCD2HQueue>>(numMpsc, capacity);
+      ProxyWorker::RegisterCallbacks(*engine->mpsc);
+    }
     for (int g = 0; g < numQueues; g++) {
       auto oq = std::make_unique<OwnedQueue>();
       if (g < numSpsc) {
-        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::SPSCD2HQueue>>(capacity);
+        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::SPSCD2HQueue>>(*engine->spsc, g);
+        oq->flushDone = engine->flushDone + g;
       } else {
-        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::MPSCD2HQueue>>(capacity);
+        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::MPSCD2HQueue>>(*engine->mpsc,
+                                                                              g - numSpsc);
       }
-      oq->flushDone = engine->flushDone + g;
       oq->lastSeq.assign(worldSize, 0);
-      raws[g] = oq->queue->Raw();
-      raws[g].flushDone = engine->flushDone + g;
-      if (g < numSpsc) raws[g].producerState = engine->spscState + 2 * g;
       engine->workers[g % numThreads]->queues.push_back(oq.get());
       engine->queues.push_back(std::move(oq));
     }
-    HipOrThrow(hipMalloc(&engine->rawGpu, sizeof(ccoProxyQueueRaw) * numQueues), "hipMalloc");
-    HipOrThrow(hipMemcpy(engine->rawGpu, raws.data(), sizeof(ccoProxyQueueRaw) * numQueues,
-                         hipMemcpyHostToDevice),
-               "hipMemcpy");
 
     // One RC QP per (proxy thread, masked peer); exchange handles the way Context does.
     std::vector<application::RdmaEndpointHandle> local(static_cast<size_t>(worldSize) * numThreads);
@@ -656,8 +657,9 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                   rank, numSpsc, numMpsc, numThreads, kSqDepth);
   out->numSpscQueues = numSpsc;
   out->numMpscQueues = numMpsc;
-  out->spscQueues = numSpsc > 0 ? engine->rawGpu : nullptr;
-  out->mpscQueues = numMpsc > 0 ? engine->rawGpu + numSpsc : nullptr;
+  out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;
+  out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
+  out->flushDone = engine->flushDone;
   out->engine = engine.get();
   return engine.release();
 }

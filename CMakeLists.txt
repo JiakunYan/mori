@@ -340,8 +340,8 @@ if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
 endif()
 
-# ccoProxy runs on the KIWI GPU-to-CPU queue library, fetched at a pinned
-# commit. Set FETCHCONTENT_SOURCE_DIR_KIWI to build against a local checkout
+# ccoProxy runs on KIWI invoke (GPU-to-CPU callbacks over the KIWI queue),
+# fetched at a pinned commit. Set FETCHCONTENT_SOURCE_DIR_KIWI to build against a local checkout
 # instead (e.g. offline).
 if(BUILD_CCO_PROXY)
   if(NOT USE_ROCM)
@@ -355,9 +355,9 @@ if(BUILD_CCO_PROXY)
     kiwi
     GIT_REPOSITORY https://github.com/AMDResearch/kiwi.git
     GIT_TAG 89342e3870af2caa6836d009dcb98f9e0e78da29)
-  # Only the queue library (KIWI::queue): no invoke layer, apps, tests or
-  # benchmarks. Build it for mori's GPU targets.
-  set(KIWI_BUILD_INVOKE OFF)
+  # Only the queue library and the header-only invoke layer (KIWI::invoke): no
+  # apps, tests or benchmarks. Build it for mori's GPU targets.
+  set(KIWI_BUILD_INVOKE ON)
   set(HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
   FetchContent_MakeAvailable(kiwi)
 endif()

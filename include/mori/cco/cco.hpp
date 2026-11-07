@@ -374,35 +374,25 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
-// ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels push
-// descriptors, with keys already resolved (the same iova=0 window addressing as
-// GDA), into KIWI device-to-host queues. A fixed set of host proxy threads
-// polls the queues and posts the RDMA work requests on host-created RC QPs, one
+// ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels invoke host
+// callbacks (KIWI invoke) with descriptors, keys already resolved (the same
+// iova=0 window addressing as GDA). A fixed set of host proxy threads polls the
+// queues and posts the RDMA work requests on host-created RC QPs, one
 // per (proxy thread, peer). Two queue pools: SPSC (one wavefront at a time per
 // queue) and MPSC. Empty when both pools are empty.
 //
-// ccoProxyQueueRaw holds one queue's device-visible state; it mirrors the KIWI
-// DeviceHandle so this header stays free of KIWI headers (cco_proxy.hpp
-// rebuilds the handle on the device).
-struct ccoProxyQueueRaw {
-  void* chunks;                   // ring, host memory
-  const uint64_t* consumerIndex;  // published consumer line, host memory
-  // MPSC: the shared claim index. SPSC: the persisted producer state
-  // {producer_index, consumer_index_cached}, loaded by ccoProxy's constructor
-  // and written back by its destructor / release(). Device memory.
-  uint64_t* producerState;
-  // Queue position (lines) just past the last FLUSH the proxy has satisfied.
-  // Fine-grained device memory, written only by the proxy, never decreases.
-  uint64_t* flushDone;
-  uint32_t log2Capacity;  // log2(capacity in 64-byte lines)
-};
-
+// Each pool is one KIWI invoke context; its device context is opaque here so
+// this header stays free of KIWI headers (cco_proxy.hpp casts it back).
 struct ccoProxyContext {
   int numSpscQueues;
   int numMpscQueues;
-  ccoProxyQueueRaw* spscQueues;  // GPU [numSpscQueues]
-  ccoProxyQueueRaw* mpscQueues;  // GPU [numMpscQueues]
-  void* engine;                  // host-only ccoProxyEngine*, opaque to kernels
+  void* spscContext;  // GPU kiwi::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC queues
+  void* mpscContext;  // GPU kiwi::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC queues
+  // [numSpscQueues] queue position (lines) just past the last FLUSH the proxy
+  // has satisfied. Fine-grained device memory, written only by the proxy,
+  // never decreases.
+  uint64_t* flushDone;
+  void* engine;  // host-only ccoProxyEngine*, opaque to kernels
 };
 
 struct ccoDevComm {

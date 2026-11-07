@@ -23,17 +23,19 @@
 //
 // cco_proxy.hpp — ccoProxy: host-proxy RDMA transport with the ccoGda window API.
 //
-// Kernels push fixed-size descriptors into a KIWI device-to-host queue (the
-// GPU->CPU queue layer); host proxy threads pop them and post ibverbs work
+// Kernels invoke host callbacks through KIWI invoke (the GPU->CPU callback
+// layer on the KIWI device-to-host queues): each op is one fixed-size
+// descriptor; host proxy threads run the callbacks, which post ibverbs work
 // requests on host-created RC QPs, one per (proxy thread, peer), on the PD that
 // owns the cco window MRs. Keys and remote addresses are resolved on the GPU
 // exactly like ccoGda (iova=0: raddr = window offset), so the proxy needs no key
 // tables.
 //
 // Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
-// ccoProxy<MPSCD2HQueue> its MPSC pool. Only one wavefront may use an SPSC queue
-// at a time: its producer state lives in device memory, loaded by the
-// constructor and written back by the destructor (or release()).
+// ccoProxy<MPSCD2HQueue> its MPSC pool; each pool is one KIWI invoke context.
+// Only one wavefront may use an SPSC queue at a time: its producer state lives
+// in the context's device handle, loaded by the constructor and saved back by
+// the destructor (or release()).
 //
 // Ordering: ops pushed by one wavefront to one queue are popped in program
 // order and land on one QP per peer, so a put followed by a signal (or a put
@@ -69,6 +71,7 @@
 #include "mori/cco/cco_scale_out.hpp"
 
 #if defined(__HIPCC__)
+#include "kiwi/invoke/device_context.hip.hpp"
 #include "kiwi/queue/device_to_host_queue.hip.hpp"
 #include "kiwi/queue/mpsc_device_to_host_queue.hip.hpp"
 #endif
@@ -79,16 +82,18 @@ namespace cco {
 /* ────────────────────────────────────────────────────────────────────────────
  *  Wire format (shared by the device API and the host proxy engine)
  *
- *  KIWI metadata (32 bits) = op | worldPeer << 8. Payload is one of the
- *  descriptors below; the op enum stays open for later ops (e.g. write-flag
- *  signals).
+ *  Each op is one KIWI invoke callback: the op is the callback id and the
+ *  descriptor below its single argument. The host engine registers the
+ *  callbacks in enum order, so the ids match; the op enum stays open for later
+ *  ops (e.g. write-flag signals).
  * ──────────────────────────────────────────────────────────────────────────── */
 
-enum ccoProxyOp : uint32_t {
-  ccoProxyOpPut = 1,        // ccoProxyPutDesc: RDMA write
-  ccoProxyOpPutSignal = 2,  // ccoProxyPutSignalDesc: RDMA write + atomic add, same QP
-  ccoProxyOpSignal = 3,     // ccoProxySignalDesc: atomic add
-  ccoProxyOpFlush = 4,      // ccoProxyFlushDesc: publish flushDone (peer unused)
+enum ccoProxyOp : uint8_t {
+  ccoProxyOpPut = 0,        // ccoProxyPutDesc: RDMA write
+  ccoProxyOpPutSignal = 1,  // ccoProxyPutSignalDesc: RDMA write + atomic add, same QP
+  ccoProxyOpSignal = 2,     // ccoProxySignalDesc: atomic add
+  ccoProxyOpFlush = 3,      // ccoProxyFlushDesc: publish flushDone
+  ccoProxyOpCount
 };
 
 enum ccoProxyFlushMode : uint32_t {
@@ -102,19 +107,19 @@ struct ccoProxyPutDesc {
   uint32_t lkey;
   uint32_t rkey;
   uint32_t bytes;
-  uint32_t pad;
+  uint32_t peer;  // world rank
 };
 
 struct ccoProxySignalDesc {
   uint64_t raddr;  // remote signal slot (window offset, iova=0)
   uint64_t value;  // atomic add operand
   uint32_t rkey;
-  uint32_t pad;
+  uint32_t peer;  // world rank
 };
 
 struct ccoProxyPutSignalDesc {
   ccoProxyPutDesc put;
-  ccoProxySignalDesc signal;
+  ccoProxySignalDesc signal;  // signal.peer == put.peer
 };
 
 struct ccoProxyFlushDesc {
@@ -129,12 +134,6 @@ static_assert(sizeof(ccoProxyFlushDesc) == 8, "one queue line");
 
 // Largest single RDMA write a descriptor carries; put() splits larger transfers.
 inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
-
-CCO_HOST_DEVICE_INLINE uint32_t ccoProxyMakeMeta(uint32_t op, int worldPeer) {
-  return op | (static_cast<uint32_t>(worldPeer) << 8);
-}
-CCO_HOST_DEVICE_INLINE uint32_t ccoProxyMetaOp(uint32_t meta) { return meta & 0xffu; }
-CCO_HOST_DEVICE_INLINE int ccoProxyMetaPeer(uint32_t meta) { return static_cast<int>(meta >> 8); }
 
 #if defined(__HIPCC__)
 
@@ -162,6 +161,7 @@ template <typename RemoteAction>
 __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, int worldPeer,
                                                         const RemoteAction& action) {
   ccoProxySignalDesc s{};
+  s.peer = static_cast<uint32_t>(worldPeer);
   if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
     s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
     s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
@@ -193,14 +193,16 @@ struct ccoProxy {
   static_assert(kSpsc || std::is_same_v<Queue, kiwi::queue::MPSCD2HQueue>,
                 "ccoProxy queue must be kiwi::queue::SPSCD2HQueue or MPSCD2HQueue");
 
+  using DeviceContext = kiwi::invoke::DeviceContext<Queue>;
+
   ccoDevComm const& comm;
   int rank;    // my index in the GDA team [0, nRanks)
   int nRanks;  // GDA team size, as ccoGda
   uint32_t queueId;
-  uint64_t* flushDone;      // this queue's flushDone (fine-grained device memory)
-  uint64_t* producerState;  // SPSC: persisted {producer_index, consumer_index_cached}
-  bool dirty;               // SPSC: pushed since the state was loaded / written back
-  typename Queue::DeviceHandle queue;
+  DeviceContext* ctx;   // this pool's invoke context
+  uint64_t* flushDone;  // SPSC: this queue's flushDone (fine-grained device memory)
+  bool dirty;           // SPSC: pushed since the handle was loaded / saved
+  typename DeviceContext::DeviceHandle handle;
 
   // queueIndex is taken modulo the pool size, like ccoGda's contextIndex.
   __device__ inline ccoProxy(ccoDevComm const& comm_, int queueIndex);
@@ -208,17 +210,12 @@ struct ccoProxy {
   ccoProxy(const ccoProxy&) = delete;
   ccoProxy& operator=(const ccoProxy&) = delete;
 
-  // SPSC: write the producer state back so the next ccoProxy on this queue
-  // (later in the kernel or in a later launch) continues from it. Called by
-  // the destructor; a no-op for MPSC and for wavefronts that never pushed.
+  // SPSC: save the handle (producer state) back so the next ccoProxy on this
+  // queue (later in the kernel or in a later launch) continues from it. Called
+  // by the destructor; a no-op for MPSC and for wavefronts that never pushed.
   __device__ inline void release() {
     if constexpr (kSpsc) {
-      if (dirty && __lane_id() == 0) {
-        __hip_atomic_store(&producerState[0], queue.producer_index, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-        __hip_atomic_store(&producerState[1], queue.consumer_index_cached, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-      }
+      if (dirty) ctx->save_device_handle(queueId, handle);
       dirty = false;
     }
   }
@@ -300,33 +297,32 @@ struct ccoProxy {
     }
   }
 
-  // Push one descriptor (whole wavefront). An SPSC push on a full ring
-  // retries; an MPSC push waits inside KIWI (and always succeeds).
+  // Invoke callback `op` with one descriptor (whole wavefront). An SPSC push on
+  // a full ring retries; an MPSC push waits inside KIWI (and always succeeds).
   template <typename Desc>
-  __device__ inline void push(uint32_t op, int worldPeer, const Desc& desc) {
-    const uint32_t meta = ccoProxyMakeMeta(op, worldPeer);
+  __device__ inline void push(ccoProxyOp op, const Desc& desc) {
     if constexpr (kSpsc) {
-      while (!queue.push_reg(desc, meta)) {
+      while (!handle.invoke(op, desc)) {
         __builtin_amdgcn_s_sleep(1);
       }
       dirty = true;
     } else {
-      queue.push_reg(desc, meta);
+      handle.invoke(op, desc);
     }
   }
 
   // Data-carrying push: make the source data (and any earlier stores the peer
   // will read) visible to the NIC before the proxy can post the WR.
   template <typename Desc>
-  __device__ inline void pushOp(uint32_t op, int worldPeer, const Desc& desc) {
+  __device__ inline void pushOp(ccoProxyOp op, const Desc& desc) {
     impl::threadFenceSystem();
-    push(op, worldPeer, desc);
+    push(op, desc);
   }
 };
 
 template <typename Queue>
 __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIndex)
-    : comm(comm_), flushDone(nullptr), producerState(nullptr), dirty(false) {
+    : comm(comm_), ctx(nullptr), flushDone(nullptr), dirty(false) {
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
       rank = comm.rank;
@@ -346,26 +342,12 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
       break;
   }
   const int poolSize = kSpsc ? comm.proxy.numSpscQueues : comm.proxy.numMpscQueues;
-  const ccoProxyQueueRaw* pool = kSpsc ? comm.proxy.spscQueues : comm.proxy.mpscQueues;
   queueId = poolSize > 0 ? static_cast<uint32_t>(queueIndex) % poolSize : 0;
-  queue = {};
+  handle = {};
   if (poolSize > 0) {
-    namespace kq = kiwi::queue::detail;
-    const ccoProxyQueueRaw& raw = pool[queueId];
-    flushDone = raw.flushDone;
-    producerState = raw.producerState;
-    queue.chunks = (kq::global_ptr<kq::Chunk>)raw.chunks;
-    queue.consumer_index = (kq::global_ptr<const uint64_t>)raw.consumerIndex;
-    queue.log2_capacity = raw.log2Capacity;
-    if constexpr (kSpsc) {
-      queue.producer_index =
-          __hip_atomic_load(&producerState[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      queue.consumer_index_cached =
-          __hip_atomic_load(&producerState[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    } else {
-      queue.producer_index = (kq::global_ptr<uint64_t>)raw.producerState;
-      queue.consumer_index_cached = 0;  // any lower bound is safe; refreshed on demand
-    }
+    ctx = static_cast<DeviceContext*>(kSpsc ? comm.proxy.spscContext : comm.proxy.mpscContext);
+    handle = ctx->get_device_handle(queueId);
+    if constexpr (kSpsc) flushDone = comm.proxy.flushDone + queueId;
   }
 }
 
@@ -392,22 +374,23 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
     d.rkey = reinterpret_cast<ccoWindowDevice*>(dstWin)->ibgdaWin.peerRkeys[worldPeer];
     d.laddr = srcOffset;
     d.raddr = dstOffset;
+    d.peer = static_cast<uint32_t>(worldPeer);
     // Split transfers one WR cannot carry; the signal rides the last piece.
     while (bytes > ccoProxyMaxPutBytes) {
       d.bytes = static_cast<uint32_t>(ccoProxyMaxPutBytes);
-      pushOp(ccoProxyOpPut, worldPeer, d);
+      pushOp(ccoProxyOpPut, d);
       d.laddr += ccoProxyMaxPutBytes;
       d.raddr += ccoProxyMaxPutBytes;
       bytes -= ccoProxyMaxPutBytes;
     }
     d.bytes = static_cast<uint32_t>(bytes);
     if constexpr (std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
-      pushOp(ccoProxyOpPut, worldPeer, d);
+      pushOp(ccoProxyOpPut, d);
     } else {
       ccoProxyPutSignalDesc ds{};
       ds.put = d;
       ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
-      pushOp(ccoProxyOpPutSignal, worldPeer, ds);
+      pushOp(ccoProxyOpPutSignal, ds);
     }
   }
   coop.sync();
@@ -422,7 +405,7 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
     peer = impl::proxyBroadcast(peer);
     remoteAction = impl::proxyBroadcast(remoteAction);
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
-    pushOp(ccoProxyOpSignal, worldPeer, impl::proxyResolveSignal(comm, worldPeer, remoteAction));
+    pushOp(ccoProxyOpSignal, impl::proxyResolveSignal(comm, worldPeer, remoteAction));
   }
   coop.sync();
 }
@@ -438,10 +421,10 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
   if (issuingWave<Coop>()) {
     ccoProxyFlushDesc d{};
     d.mode = Mode;
-    push(ccoProxyOpFlush, 0, d);
+    push(ccoProxyOpFlush, d);
     // Position just past our FLUSH; flushDone reaches it only once the proxy
     // has satisfied this FLUSH (it retires flushes in queue order).
-    const uint64_t pos = queue.producer_index;
+    const uint64_t pos = handle.queue.producer_index;
     if (__lane_id() == 0) {
       while (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < pos) {
         __builtin_amdgcn_s_sleep(1);

@@ -120,7 +120,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       // flushDone covers the FLUSH, which sits after every put of this queue.
       if (threadIdx.x == 0 &&
           __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) <
-              proxy.queue.producer_index) {
+              proxy.handle.queue.producer_index) {
         printf("[rank %d] kiwi_flush: unit %d flushDone behind the queue\n", me, u);
         atomicExch(err, 1);
       }

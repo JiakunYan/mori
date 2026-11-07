@@ -25,7 +25,7 @@
 //
 // Plain C++ interface so the host control plane (cco_init.cpp, compiled as CXX
 // where ccoComm is visible) can drive it; the implementation is a HIP TU
-// because the KIWI queue headers are HIP.
+// because the KIWI headers are HIP.
 #pragma once
 
 #include <cstddef>
