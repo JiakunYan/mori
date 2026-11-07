@@ -395,6 +395,10 @@ struct ccoProxyContext {
   // [numMpscQueues] flush tickets taken per MPSC queue. Device memory, written
   // only by kernels (atomic fetch-add), never decreases.
   uint64_t* flushTicket;
+  // [numMpscQueues] the largest MPSC credit cache (a consumer index read by a
+  // handle) saved per queue, so new handles skip the first consumer-index read.
+  // Device memory, written only by kernels (atomic max), never decreases.
+  uint64_t* mpscCredit;
   // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
   // max_msg_sz of any rank's port. put() splits larger transfers.
   uint64_t maxPutBytes;

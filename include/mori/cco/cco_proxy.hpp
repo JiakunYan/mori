@@ -208,6 +208,8 @@ struct ccoProxy {
   DeviceContext* ctx;     // this pool's invoke context
   uint64_t* flushDone;    // this queue's satisfied-FLUSH count (fine-grained device memory)
   uint64_t* flushTicket;  // MPSC: this queue's flush ticket counter (device memory)
+  uint64_t* mpscCredit;   // MPSC: this queue's saved credit cache (device memory)
+  uint64_t creditLoaded;  // MPSC: the handle's credit cache after construction / release()
   bool dirty;             // SPSC: pushed since the handle was loaded / saved
   typename DeviceContext::DeviceHandle handle;
 
@@ -221,12 +223,25 @@ struct ccoProxy {
 
   // SPSC: save the handle (producer state) back so the next ccoProxy on this
   // queue (later in the kernel, after the release/acquire described in the
-  // file comment, or in a later launch) continues from it. Called by the
-  // destructor; a no-op for MPSC and for wavefronts that never pushed.
+  // file comment, or in a later launch) continues from it. A no-op for
+  // wavefronts that never pushed.
+  // MPSC: save only the handle's credit cache (the consumer index it last
+  // read), if it grew, so later handles on this queue do not start from the
+  // ring's initial credit and read the host consumer index over PCIe on their
+  // first push once the ring has wrapped. See the constructor for why any
+  // saved value is safe. Called by the destructor.
   __device__ inline void release() {
     if constexpr (kSpsc) {
       if (dirty) ctx->save_device_handle(queueId, handle);
       dirty = false;
+    } else {
+      const uint64_t credit = handle.queue.consumer_index_cached;  // wave-uniform
+      if (credit > creditLoaded) {
+        if (__lane_id() == 0) {
+          __hip_atomic_fetch_max(mpscCredit, credit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        creditLoaded = credit;
+      }
     }
   }
 
@@ -351,6 +366,8 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
       ctx(nullptr),
       flushDone(nullptr),
       flushTicket(nullptr),
+      mpscCredit(nullptr),
+      creditLoaded(0),
       dirty(false) {
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
@@ -400,7 +417,30 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
   handle = ctx->get_device_handle(queueId);
   // flushDone: SPSC pool, then MPSC pool.
   flushDone = comm.proxy.flushDone + (kSpsc ? 0 : comm.proxy.numSpscQueues) + queueId;
-  if constexpr (!kSpsc) flushTicket = comm.proxy.flushTicket + queueId;
+  if constexpr (!kSpsc) {
+    flushTicket = comm.proxy.flushTicket + queueId;
+    // Start the credit cache from the largest one an earlier handle on this
+    // queue saved (release()). KIWI's MPSC handle only ever sets its cache to
+    // a value of the published consumer index (at creation, or when a push
+    // re-reads it), which the single consumer only moves forward and never
+    // past its own position. So every value a cache has held is a lower bound
+    // on the consumer position from then on, i.e. valid credit for any later
+    // push ("any earlier published value is a safe lower bound"); a stale one
+    // costs at most the consumer-index read we want to avoid. The word is
+    // only written by an atomic max, so it never moves back or tears. The KIWI
+    // handle array itself is left alone: other wavefronts load it concurrently,
+    // and KIWI exposes no store of the credit field alone.
+    mpscCredit = comm.proxy.mpscCredit + queueId;
+    const uint64_t saved =
+        __hip_atomic_load(mpscCredit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // Wave-uniform (SGPRs), as KIWI's push requires of its credit cache.
+    const uint64_t savedU =
+        (static_cast<uint64_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(saved >> 32)))
+         << 32) |
+        __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(saved));
+    if (savedU > handle.queue.consumer_index_cached) handle.queue.consumer_index_cached = savedU;
+    creditLoaded = handle.queue.consumer_index_cached;
+  }
 }
 
 template <typename Queue>
