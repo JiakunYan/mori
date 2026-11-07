@@ -503,7 +503,6 @@ class ccoProxyEngine {
     free(scratch);
     if (flushDone) (void)hipFree(flushDone);
     if (flushTicket) (void)hipFree(flushTicket);
-    if (mpscCredit) (void)hipFree(mpscCredit);
   }
 
   void StopAndJoin() {
@@ -520,7 +519,6 @@ class ccoProxyEngine {
   void* scratch{nullptr};
   uint64_t* flushDone{nullptr};    // fine-grained device [numSpsc + numMpsc]
   uint64_t* flushTicket{nullptr};  // device [numMpsc]
-  uint64_t* mpscCredit{nullptr};   // device [numMpsc]
   std::atomic<bool> stop{false};
 };
 
@@ -621,8 +619,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
 
     // flushDone: fine-grained device memory (the GPU polls it locally, the
-    // proxy writes it over PCIe). MPSC flush tickets and saved credits: plain
-    // device memory, only touched by GPU atomics.
+    // proxy writes it over PCIe). MPSC flush tickets: plain device memory, only
+    // touched by GPU atomics.
     HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
                                      sizeof(uint64_t) * numQueues, hipDeviceMallocFinegrained),
                "hipExtMallocWithFlags");
@@ -632,11 +630,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
           hipMalloc(reinterpret_cast<void**>(&engine->flushTicket), sizeof(uint64_t) * numMpsc),
           "hipMalloc");
       HipOrThrow(hipMemset(engine->flushTicket, 0, sizeof(uint64_t) * numMpsc), "hipMemset");
-      // 0: the published consumer index the queues start from.
-      HipOrThrow(
-          hipMalloc(reinterpret_cast<void**>(&engine->mpscCredit), sizeof(uint64_t) * numMpsc),
-          "hipMalloc");
-      HipOrThrow(hipMemset(engine->mpscCredit, 0, sizeof(uint64_t) * numMpsc), "hipMemset");
     }
     HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
 
@@ -737,7 +730,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
   out->flushDone = engine->flushDone;
   out->flushTicket = engine->flushTicket;
-  out->mpscCredit = engine->mpscCredit;
   out->maxPutBytes = maxMsgBytes;
   out->engine = engine.get();
   return engine.release();
