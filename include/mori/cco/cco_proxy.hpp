@@ -86,7 +86,9 @@
 // compare per push).
 // Every issuing lane must pass identical arguments. Lane i writes word i of the
 // descriptor, so differing arguments would build a descriptor that mixes
-// fields from different lanes; that is a usage error and is not checked.
+// fields from different lanes; that is a usage error, checked (print + trap)
+// in builds without NDEBUG only, and only across the issuing wavefront's lanes
+// (with ccoCoopBlock the other wavefronts' arguments are not read).
 // (ccoGda only reads thread_rank 0's arguments.)
 //
 // Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
@@ -309,7 +311,8 @@ struct ccoProxy {
   // Invoke callback `op` with its descriptor, if any (whole wavefront). An SPSC
   // push on a full ring retries; an MPSC push waits inside KIWI (and always
   // succeeds). Traps on a partial wavefront, which KIWI does not check in
-  // release builds.
+  // release builds, and (builds without NDEBUG) on lanes passing differing
+  // descriptors.
   template <typename... Desc>
   __device__ inline void invoke(ccoProxyOp op, const Desc&... desc) {
     const uint64_t exec = __builtin_amdgcn_read_exec();
@@ -324,6 +327,9 @@ struct ccoProxy {
 #endif
       __builtin_trap();  // partial wavefront: all 64 lanes must push
     }
+#ifndef NDEBUG  // see the file comment
+    (checkUniformDesc(op, desc), ...);
+#endif
     if constexpr (kSpsc) {
       while (!handle.invoke(op, desc...)) {
         __builtin_amdgcn_s_sleep(1);
@@ -333,6 +339,38 @@ struct ccoProxy {
       handle.invoke(op, desc...);
     }
   }
+
+#ifndef NDEBUG
+  // Trap unless every lane of the (full) issuing wavefront passes lane 0's
+  // descriptor: lane i pushes 8-byte word i, so a mismatch would mix lanes.
+  template <typename Desc>
+  __device__ static inline void checkUniformDesc(ccoProxyOp op, const Desc& desc) {
+    static_assert(
+        sizeof(Desc) % sizeof(uint64_t) == 0 && std::has_unique_object_representations_v<Desc>,
+        "descriptor must be whole 8-byte words without padding");
+    constexpr int kWords = sizeof(Desc) / sizeof(uint64_t);
+    uint64_t w[kWords];
+    __builtin_memcpy(w, &desc, sizeof(Desc));
+    int badWord = -1;  // first descriptor word differing from lane 0's
+    for (int i = 0; i < kWords && badWord < 0; ++i) {
+      const uint32_t lo = static_cast<uint32_t>(w[i]);
+      const uint32_t hi = static_cast<uint32_t>(w[i] >> 32);
+      if (lo != __builtin_amdgcn_readfirstlane(lo) || hi != __builtin_amdgcn_readfirstlane(hi)) {
+        badWord = i;
+      }
+    }
+    const uint64_t badLanes = __ballot(badWord >= 0);
+    if (__builtin_expect(badLanes != 0, 0)) {
+      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(badLanes))) {
+        printf(
+            "ccoProxy: op %u: lane %u passed arguments that differ from lane 0's (descriptor "
+            "word %d); every issuing lane must pass identical arguments\n",
+            static_cast<unsigned>(op), __lane_id(), badWord);
+      }
+      __builtin_trap();  // lanes passed differing arguments
+    }
+  }
+#endif
 
   // invoke() for a data-carrying op: first make the source data (and any earlier
   // stores the peer will read) visible to the NIC, since the proxy may post the
