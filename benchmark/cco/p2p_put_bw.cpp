@@ -27,7 +27,7 @@
 //   -t ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
 //   -t proxy : one-sided RDMA write via ccoProxy (KIWI queue + -Q host proxy
 //              threads). Same split and completion as ibgda: each unit puts its
-//              slice every iteration, then flushes (network mode) its queue.
+//              slice every iteration, then flushes its queue.
 //              -q spsc: one queue per unit; -q mpsc: one queue per block.
 //              Small sizes with -s warp and many blocks give the message rate
 //              (Mpps column).
@@ -117,8 +117,8 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
 #ifdef MORI_CCO_PROXY
 // Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
-// iteration, then a network-mode flush waits until its puts completed (remote
-// ack) -- the counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
+// iteration, then a flush waits until its puts completed (remote ack) -- the
+// counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
 // queue b * nunits + u; MPSC: the block's units share queue b.
 template <typename Q, typename Coop>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
@@ -142,7 +142,7 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
               reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
   }
-  proxy.template flush<ccoProxyFlushNetwork>(coop);
+  proxy.flush(coop);
 }
 
 template <typename Q>

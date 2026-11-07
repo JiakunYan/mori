@@ -51,11 +51,13 @@ struct ccoProxyEngineConfig {
 
 class ccoProxyEngine;
 
-// Collective over `bootNet` (QP handle exchange). Call with the comm's HIP
-// device current (the queues and flush counters are allocated on it). Builds
-// the queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
+// Collective over `bootNet`; every rank must pass the same queue and thread
+// counts (ccoDevCommCreate checks that first). Call with the comm's HIP device
+// current (the queues and flush counters are allocated on it). Builds the
+// queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
 // MRs are valid on them) and starts the proxy threads. Fills `out` on success;
-// returns nullptr on failure.
+// returns nullptr on failure. A failure in any rank's local setup (before the
+// QP exchange) makes every rank fail.
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out);

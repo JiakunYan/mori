@@ -66,7 +66,7 @@ void PrintUsage(const char* program) {
                "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
                "                 baseline rings each, -a rings once for all\n"
                "  -P             latency: ping-pong put + SignalInc, both PEs run,\n"
-               "                 latency = round trip / 2 (ibgda, proxy; proxy default)\n"
+               "                 latency = round trip / 2 (ibgda, proxy)\n"
                "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
                "  -Q threads     proxy: host proxy threads (default 4)\n"
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"

@@ -25,8 +25,8 @@
 //   -t lsa   : single flat-VA store of the whole buffer + system fence.
 //   -t sdma  : single copy-engine put + completion wait (-C quiet | signal).
 //   -t ibgda : single RDMA write + flush per iteration.
-//   -t proxy : ccoProxy (KIWI queue + host proxy): single put + network-mode
-//              flush per iteration, the counterpart of ibgda's put + flush.
+//   -t proxy : ccoProxy (KIWI queue + host proxy): single put + flush per
+//              iteration, the counterpart of ibgda's put + flush.
 //
 // -P / -S (ibgda, proxy): ping-pong instead -- PE 0 sends put + SignalInc (-P)
 // or a bare signal (-S), PE 1 echoes it back; latency = round trip / 2.
@@ -127,8 +127,8 @@ __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 #ifdef MORI_CCO_PROXY
-// Proxy: one put of the whole buffer + network-mode flush (the put completed,
-// remote side acknowledged) per iteration, on SPSC queue 0. Coop is the issue
+// Proxy: one put of the whole buffer + flush (the put completed, remote side
+// acknowledged) per iteration, on SPSC queue 0. Coop is the issue
 // scope (warp / block).
 template <typename Coop>
 __global__ void proxy_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t bytes,
@@ -139,7 +139,7 @@ __global__ void proxy_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin
   for (int i = 0; i < iter; i++) {
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
               reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, ccoGda_NoSignal{}, Coop{});
-    proxy.template flush<ccoProxyFlushNetwork>(Coop{});
+    proxy.flush(Coop{});
   }
 }
 #endif

@@ -50,17 +50,17 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t lsa -b 1M -e 1G -f 4 -n 20 -w 5
 
 ## ccoProxy vs ccoGda
 
-`-t proxy` runs the ibgda kernels' shape with `ccoProxy`. ibgda's local-completion
-`flush` maps to a network-mode `flush<ccoProxyFlushNetwork>`, which waits until
-the proxy has seen every earlier put of the queue complete.
+`-t proxy` runs the ibgda kernels' shape with `ccoProxy`. ibgda's `flush` maps
+to ccoProxy's `flush`, which waits until the proxy has seen every earlier put
+of the queue complete.
 
-- `cco_p2p_put_latency -t proxy`: one put + network flush per iteration.
+- `cco_p2p_put_latency -t proxy`: one put + flush per iteration.
   - `-P` switches ibgda or proxy to a ping-pong: put + SignalInc, PE 1 echoes,
     and the reported value is round trip / 2.
   - `-S` is the same ping-pong with bare signals.
 - `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, or wavefront with
-  `-s warp`) puts its slice every iteration, then does one network flush per
-  launch, as ibgda does with `flush`.
+  `-s warp`) puts its slice every iteration, then does one flush per launch,
+  as ibgda does with `flush`.
   - `-q spsc` (default) gives every unit its own SPSC queue; `-q mpsc` shares
     one MPSC queue per block.
   - `-Q` sets the number of host proxy threads (default 4).

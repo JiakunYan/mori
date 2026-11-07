@@ -395,6 +395,9 @@ struct ccoProxyContext {
   // [numMpscQueues] flush tickets taken per MPSC queue. Device memory, written
   // only by kernels (atomic fetch-add), never decreases.
   uint64_t* flushTicket;
+  // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
+  // max_msg_sz of any rank's port. put() splits larger transfers.
+  uint64_t maxPutBytes;
   void* engine;  // host-only ccoProxyEngine*, opaque to kernels
 };
 
@@ -517,7 +520,12 @@ struct ccoDevCommRequirements {
   // ccoProxy (host-proxy RDMA, needs a BUILD_CCO_PROXY build). Separate SPSC and
   // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
   // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
-  // signal slots, so gdaConnectionType must resolve to non-NONE.
+  // signal slots, so gdaConnectionType must resolve to non-NONE. Every rank must
+  // pass the same queue and thread counts (checked; creation fails otherwise),
+  // and the GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy
+  // queues starts its own busy-polling threads, pinned by the same policy
+  // (MORI_CCO_PROXY_CPUS or the GPU-local cores), so several such DevComms
+  // oversubscribe the same CPUs; prefer one per comm.
   int proxySpscQueueCount;  // 0 = no SPSC pool
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
@@ -953,6 +961,10 @@ struct ccoComm {
 
   std::vector<ccoWindowHost*> windows;
 
+  // Live ccoProxy engines (ccoProxyEngine*, one per DevComm with proxy queues),
+  // so ccoCommDestroy can stop any whose DevComm was never destroyed.
+  std::vector<void*> proxyEngines;
+
   struct WindowTableEntry {
     uintptr_t base;
     uintptr_t size;
@@ -990,6 +1002,9 @@ struct ccoUniqueId {
 int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
+// Destroy every DevComm first. A DevComm with ccoProxy queues left alive is
+// warned about and its proxy engine stopped here (collectively, as in
+// ccoDevCommDestroy); its other device resources are leaked.
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──

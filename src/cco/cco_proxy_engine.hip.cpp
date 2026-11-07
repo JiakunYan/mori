@@ -37,12 +37,12 @@
 // completedSeq.
 //
 // Flush: each queue tracks, per peer, the sequence of the last WR it produced.
-// A popped FLUSH first posts every pending WR, then becomes a pending flush:
-// kiwi mode waits for nothing, network mode for this queue's last WR on every
-// peer that still has work outstanding.
-// Pending flushes retire in FIFO order, so a kiwi FLUSH behind a network FLUSH
-// waits for it; each retired FLUSH adds 1 to flushDone[q]. The GPU side turns
-// that count into "my FLUSH is satisfied" (see cco_proxy.hpp).
+// A popped FLUSH first posts every pending WR, then becomes a pending flush
+// that waits for this queue's last WR on every peer that still has work
+// outstanding. Pending flushes retire in FIFO order (a later FLUSH never waits
+// for less than an earlier one), and each retired FLUSH adds 1 to
+// flushDone[q]. The GPU side turns that count into "my FLUSH is satisfied"
+// (see cco_proxy.hpp).
 
 // cco headers first: core/utils.hpp (pulled in by the application headers)
 // defines a `warpSize` macro that would break cco.hpp's impl::warpSize().
@@ -70,6 +70,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -272,7 +273,9 @@ class ProxyWorker {
     Register(ctx, ccoProxyOpPut, &ProxyWorker::OnPut);
     Register(ctx, ccoProxyOpPutSignal, &ProxyWorker::OnPutSignal);
     Register(ctx, ccoProxyOpSignal, &ProxyWorker::OnSignal);
-    Register(ctx, ccoProxyOpFlush, &ProxyWorker::OnFlush);
+    const uint8_t flushId =
+        ctx.register_callback(std::function<void()>([] { current_->OnFlush(); }));
+    if (flushId != ccoProxyOpFlush) throw std::runtime_error("ccoProxy callback id mismatch");
   }
 
   std::vector<ProxyQp> qps;         // [worldSize]; active for masked peers
@@ -359,18 +362,14 @@ class ProxyWorker {
     cur_->lastSeq[d.peer] = AddAtomic(qp, d);
   }
 
-  void OnFlush(const ccoProxyFlushDesc& d) {
+  void OnFlush() {
     OwnedQueue& oq = *cur_;
-    // Everything before the FLUSH is popped; post it too, so even a kiwi
-    // FLUSH means "handed to the NIC".
-    for (int p : activePeers_) PostChain(qps[p]);
+    // Everything before the FLUSH is popped; post it, then wait for this
+    // queue's last WR on every peer that still has one outstanding.
     PendingFlush f;
-    if (d.mode == ccoProxyFlushNetwork) {
-      for (int p : activePeers_) {
-        if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
-      }
-    } else if (d.mode != ccoProxyFlushKiwi) {
-      ProxyFatal(id_, "unknown flush mode " + std::to_string(d.mode));
+    for (int p : activePeers_) {
+      PostChain(qps[p]);
+      if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
     }
     oq.pending.push_back(std::move(f));
     RetireFlushes(oq);
@@ -523,24 +522,47 @@ class ccoProxyEngine {
   std::atomic<bool> stop{false};
 };
 
+namespace {
+
+// Per-rank setup result, Allgather'd before the QP exchange.
+struct ProxyCreateInfo {
+  int32_t ok;  // this rank's local setup succeeded
+  int32_t pad;
+  uint64_t maxMsgBytes;  // the port's max_msg_sz
+};
+
+}  // namespace
+
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out) {
   auto engine = std::make_unique<ccoProxyEngine>();
   engine->bootNet = bootNet;
+  const int worldSize = bootNet->GetWorldSize();
+  const int rank = bootNet->GetLocalRank();
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
-  const int numQueues = numSpsc + numMpsc;
+  // Summed in 64 bits and validated below before any use as an int.
+  const int64_t numQueues64 = int64_t{numSpsc} + int64_t{numMpsc};
+  const int numQueues =
+      static_cast<int>(std::clamp<int64_t>(numQueues64, 0, std::numeric_limits<int>::max()));
   // Never more threads than queues: a thread without a queue would only spin.
   const int numThreads =
       std::min(config.numThreads > 0 ? config.numThreads : kDefaultMaxThreads, numQueues);
-  const int worldSize = bootNet->GetWorldSize();
-  const int rank = bootNet->GetLocalRank();
+
+  // Local setup: everything up to the QP handle exchange. A failure here is
+  // reported to every rank by the Allgather below, so all ranks fail together.
+  ProxyCreateInfo mine{};
+  std::string error;
+  std::vector<application::RdmaEndpointHandle> local(static_cast<size_t>(worldSize) *
+                                                     std::max(numThreads, 0));
   try {
     application::RdmaDeviceContext* devCtx = ctx->GetRdmaDeviceContext();
     if (devCtx == nullptr) throw std::runtime_error("no RDMA device context");
-    if (numSpsc < 0 || numMpsc < 0 || numQueues <= 0) {
-      throw std::runtime_error("need a positive number of queues");
+    if (numSpsc < 0 || numMpsc < 0 || numQueues64 <= 0 ||
+        numQueues64 > std::numeric_limits<int>::max()) {
+      throw std::runtime_error("bad queue counts: " + std::to_string(numSpsc) + " SPSC + " +
+                               std::to_string(numMpsc) + " MPSC");
     }
     if (static_cast<int>(config.peerMask.size()) != worldSize) {
       throw std::runtime_error("peerMask size != worldSize");
@@ -550,10 +572,23 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         capacity < kiwi::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
       throw std::runtime_error("queue capacity must be a power of two >= the largest descriptor");
     }
+    // The proxy threads store the flush counters into fine-grained VRAM, so the
+    // CPU must be able to map device memory (large BAR).
+    int dev = -1, largeBar = 0;
+    HipOrThrow(hipGetDevice(&dev), "hipGetDevice");
+    HipOrThrow(hipDeviceGetAttribute(&largeBar, hipDeviceAttributeIsLargeBar, dev),
+               "hipDeviceGetAttribute(IsLargeBar)");
+    if (!largeBar) {
+      throw std::runtime_error("GPU " + std::to_string(dev) +
+                               " has no host-mapped VRAM (large BAR), which the proxy threads "
+                               "need to write the flush counters");
+    }
 
     // Host-posted ibverbs QPs on the PD that owns the window MRs (borrowed).
+    // They never receive, so skip the receive buffers mori's shmem proxy uses.
     engine->ibv = std::make_unique<application::IBVerbsDeviceContext>(
         devCtx->GetRdmaDevice(), devCtx->GetIbvPd(), /*ownsPd=*/false);
+    engine->ibv->SetProxyRecvBuffersEnabled(false);
     application::RdmaEndpointConfig epConfig = ctx->GetRdmaEndpointConfig();  // port, GID index
     epConfig.maxMsgsNum = kSqDepth;
     epConfig.maxCqeNum = kSqDepth;
@@ -563,6 +598,11 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     epConfig.withCompChannel = false;
     epConfig.enableSrq = false;
     epConfig.atomicIbufSlots = 0;  // atomics return into the per-thread scratch slot below
+    const ibv_port_attr* portAttr = devCtx->GetRdmaDevice()->GetPortAttr(epConfig.portId);
+    if (portAttr == nullptr || portAttr->max_msg_sz == 0) {
+      throw std::runtime_error("port " + std::to_string(epConfig.portId) + " max_msg_sz unknown");
+    }
+    mine.maxMsgBytes = portAttr->max_msg_sz;
 
     if (posix_memalign(&engine->scratch, 4096, kScratchStride * numThreads) != 0) {
       throw std::runtime_error("scratch allocation failed");
@@ -619,9 +659,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       engine->queues.push_back(std::move(oq));
     }
 
-    // One RC QP per (proxy thread, masked peer); exchange handles the way Context does.
-    std::vector<application::RdmaEndpointHandle> local(static_cast<size_t>(worldSize) * numThreads);
-    std::vector<application::RdmaEndpointHandle> remote(local.size());
+    // One RC QP per (proxy thread, masked peer).
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
       for (int t = 0; t < numThreads; t++) {
@@ -631,6 +669,33 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         local[peer * numThreads + t] = qp.ep.handle;
       }
     }
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+
+  // Every rank must have set up before the exchange. All ranks see the same
+  // table, so they all fail or all go on. (The caller has already checked that
+  // every rank passed the same queue and thread counts, so numThreads, the
+  // handles sent per peer, matches.) One RDMA write must fit every port.
+  mine.ok = error.empty() ? 1 : 0;
+  std::vector<ProxyCreateInfo> all(worldSize);
+  bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
+  uint64_t maxMsgBytes = ccoProxyMaxPutBytes;
+  for (int r = 0; r < worldSize && error.empty(); r++) {
+    if (!all[r].ok) {
+      error = "rank " + std::to_string(r) + " failed to set up its proxy engine";
+    } else {
+      maxMsgBytes = std::min(maxMsgBytes, all[r].maxMsgBytes);
+    }
+  }
+  if (!error.empty()) {
+    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, error);
+    return nullptr;  // engine destructor releases what was built
+  }
+
+  try {
+    // Exchange QP handles the way Context does, then connect and start.
+    std::vector<application::RdmaEndpointHandle> remote(local.size());
     bootNet->AllToAll(local.data(), remote.data(),
                       sizeof(application::RdmaEndpointHandle) * numThreads);
     for (int peer = 0; peer < worldSize; peer++) {
@@ -655,14 +720,17 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     return nullptr;  // engine destructor stops threads and releases what was built
   }
 
-  MORI_SHMEM_INFO("ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} sqDepth={}",
-                  rank, numSpsc, numMpsc, numThreads, kSqDepth);
+  MORI_SHMEM_INFO(
+      "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} sqDepth={} "
+      "maxPutBytes={}",
+      rank, numSpsc, numMpsc, numThreads, kSqDepth, maxMsgBytes);
   out->numSpscQueues = numSpsc;
   out->numMpscQueues = numMpsc;
   out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;
   out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
   out->flushDone = engine->flushDone;
   out->flushTicket = engine->flushTicket;
+  out->maxPutBytes = maxMsgBytes;
   out->engine = engine.get();
   return engine.release();
 }

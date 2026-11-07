@@ -87,6 +87,7 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         void* mpscContext
         uint64_t* flushDone
         uint64_t* flushTicket
+        uint64_t maxPutBytes
         void* engine
 
     cdef struct ccoDevCommRequirements:
