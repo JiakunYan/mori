@@ -25,7 +25,7 @@
 //
 // FULL connectivity; kSpscQueues SPSC + kMpscQueues MPSC proxy queues polled by
 // kProxyThreads proxy threads. Block u of a put kernel is a "unit": it uses
-// queue u (modulo the pool size) and sends a distinct chunk to every peer:
+// queue u (MPSC: modulo the pool size) and sends a distinct chunk to every peer:
 //   recv[(src * nUnits + u) * chunk + i] = Pattern(salt, src, dst, u, i)
 // Signal slot (src * kMaxUnits + u) on the receiver counts that chunk's arrival
 // (put-carried or a trailing signal on the same queue, hence after the data).
@@ -118,7 +118,7 @@ __host__ __device__ inline ccoGdaSignal_t Slot(int src, int unit) {
   return static_cast<ccoGdaSignal_t>(src * kMaxUnits + unit);
 }
 
-// Block u = unit u on queue u (modulo the pool). Sends one chunk to every peer,
+// Block u = unit u on queue u (MPSC: modulo the pool). Sends one chunk to every peer,
 // then waits for every sender's chunk on this unit (signal slot or flag word).
 template <typename Q, typename Coop, int Mode>
 __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,

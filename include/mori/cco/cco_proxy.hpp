@@ -34,12 +34,16 @@
 // Queues: ccoProxy<SPSCD2HQueue> (default) indexes the DevComm's SPSC pool,
 // ccoProxy<MPSCD2HQueue> its MPSC pool; each pool is one KIWI invoke context.
 // Constructing a ccoProxy<Q> whose pool is empty traps (the DevComm was created
-// with a zero proxySpscQueueCount / proxyMpscQueueCount).
+// with a zero proxySpscQueueCount / proxyMpscQueueCount). An MPSC queueIndex is
+// taken modulo the pool size, like ccoGda's contextIndex. An SPSC queueIndex
+// must be in [0, proxySpscQueueCount) and traps otherwise: wrapping would let
+// two wavefronts share an SPSC queue, which silently corrupts it.
 //
 // Usage errors trap instead of corrupting a queue or faulting: a ccoProxy<Q>
-// on an empty pool, and a push from a partial wavefront (below). Builds without
-// NDEBUG also print the reason first; release builds only trap, since an
-// inlined device printf would add registers to every kernel using ccoProxy.
+// on an empty pool, an SPSC queueIndex out of range, and a push from a partial
+// wavefront (below). Builds without NDEBUG also print the reason first; release
+// builds only trap, since an inlined device printf would add registers to every
+// kernel using ccoProxy.
 // Only one wavefront may use an SPSC queue at a time: its producer state lives
 // in the context's device handle, loaded by the constructor and saved back by
 // the destructor (or release()). Handing an SPSC queue to another wavefront of
@@ -207,8 +211,9 @@ struct ccoProxy {
   bool dirty;             // SPSC: pushed since the handle was loaded / saved
   typename DeviceContext::DeviceHandle handle;
 
-  // queueIndex is taken modulo the pool size, like ccoGda's contextIndex.
-  // Traps if this pool is empty.
+  // SPSC: queueIndex must be in [0, numSpscQueues); MPSC: taken modulo the pool
+  // size, like ccoGda's contextIndex. Traps if this pool is empty or (SPSC) the
+  // index is out of range.
   __device__ inline ccoProxy(ccoDevComm const& comm_, int queueIndex);
   __device__ inline ~ccoProxy() { release(); }
   ccoProxy(const ccoProxy&) = delete;
@@ -375,7 +380,22 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
 #endif
     __builtin_trap();  // this DevComm has no queues in this pool
   }
-  queueId = static_cast<uint32_t>(queueIndex) % static_cast<uint32_t>(poolSize);
+  if constexpr (kSpsc) {
+    // No wrap: two wavefronts sharing an SPSC queue would write the same ring
+    // lines and corrupt it. One unsigned compare also catches a negative index.
+    if (__builtin_expect(static_cast<uint32_t>(queueIndex) >= static_cast<uint32_t>(poolSize), 0)) {
+#ifndef NDEBUG  // see the file comment
+      if (__lane_id() == static_cast<unsigned>(__builtin_ctzll(__builtin_amdgcn_read_exec()))) {
+        printf("ccoProxy: SPSC queueIndex %d out of range [0, %d) (proxySpscQueueCount)\n",
+               queueIndex, poolSize);
+      }
+#endif
+      __builtin_trap();  // SPSC queue index out of range
+    }
+    queueId = static_cast<uint32_t>(queueIndex);
+  } else {
+    queueId = static_cast<uint32_t>(queueIndex) % static_cast<uint32_t>(poolSize);
+  }
   ctx = static_cast<DeviceContext*>(kSpsc ? comm.proxy.spscContext : comm.proxy.mpscContext);
   handle = ctx->get_device_handle(queueId);
   // flushDone: SPSC pool, then MPSC pool.
