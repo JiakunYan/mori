@@ -120,9 +120,11 @@ struct PerfArgs {
   // -S is signal-only. ibgda and proxy.
   bool pingpong = false;
   bool signal_only = false;
-  // proxy: host proxy threads (-Q). One SPSC queue per issuing unit (block,
-  // or wavefront with -s warp).
+  // proxy: host proxy threads (-Q) and queue kind (-q). SPSC: one queue per
+  // issuing unit (block, or wavefront with -s warp). MPSC: one queue per block,
+  // shared by its wavefronts.
   int proxy_threads = kDefaultProxyThreads;
+  bool proxy_mpsc = false;
 };
 
 // SPSC proxy queues needed so that every issuing unit owns one: units per block

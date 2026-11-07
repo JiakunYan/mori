@@ -68,8 +68,9 @@ void PrintUsage(const char* program) {
                "  -P             latency: ping-pong put + SignalInc, both PEs run,\n"
                "                 latency = round trip / 2 (ibgda, proxy; proxy default)\n"
                "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
-               "  -Q threads     proxy: host proxy threads (default 4); one SPSC queue\n"
-               "                 per block, or per wavefront with -s warp\n"
+               "  -Q threads     proxy: host proxy threads (default 4)\n"
+               "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
+               "                 per wavefront with -s warp) | mpsc (one queue per block)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -101,7 +102,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -120,6 +121,15 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         break;
       case 'Q':
         out_args->proxy_threads = std::atoi(optarg);
+        break;
+      case 'q':
+        if (std::strcmp(optarg, "spsc") == 0) {
+          out_args->proxy_mpsc = false;
+        } else if (std::strcmp(optarg, "mpsc") == 0) {
+          out_args->proxy_mpsc = true;
+        } else {
+          return 1;
+        }
         break;
       case 'b':
         out_args->min_size = parse_size(optarg);
@@ -432,9 +442,13 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       return 1;
 #endif
       reqs.gdaContextCount = 1;  // GDA QPs unused; ccoProxy only borrows the signal slots
-      reqs.proxySpscQueueCount =
-          args.nblocks *
-          ProxyUnitsPerBlock(args.put_scope, args.threads_per_block, ctx->device_warp_size);
+      if (args.proxy_mpsc) {
+        reqs.proxyMpscQueueCount = args.nblocks;
+      } else {
+        reqs.proxySpscQueueCount =
+            args.nblocks *
+            ProxyUnitsPerBlock(args.put_scope, args.threads_per_block, ctx->device_warp_size);
+      }
       reqs.proxyThreadCount = args.proxy_threads;
     }
   }
@@ -467,7 +481,8 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // The other PE's index within the LSA team.
     ctx->peer_lsa_rank = ctx->devComm.lsaRank ^ 1;
   } else {
-    if (args.transport == Transport::kProxy && ctx->devComm.proxy.numSpscQueues == 0) {
+    if (args.transport == Transport::kProxy &&
+        ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues == 0) {
       if (ctx->my_pe == 0) std::fprintf(stderr, "ccoProxy queues were not created\n");
       PerfFinalize(ctx);
       return 1;
@@ -497,9 +512,10 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
                   ctx->devComm.lsaSize);
     } else if (args.transport == Transport::kProxy) {
       std::printf(
-          "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d SPSC KIWI queues, %d host proxy "
+          "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues, %d host proxy "
           "threads; gdaConnType=%d)\n",
-          ctx->devComm.proxy.numSpscQueues, args.proxy_threads,
+          ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
+          args.proxy_mpsc ? "MPSC" : "SPSC", args.proxy_threads,
           static_cast<int>(ctx->devComm.gdaConnType));
     } else {
       std::printf(

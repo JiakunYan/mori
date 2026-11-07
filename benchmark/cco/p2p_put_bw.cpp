@@ -27,8 +27,9 @@
 //   -t ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
 //   -t proxy : one-sided RDMA write via ccoProxy (KIWI queue + -Q host proxy
 //              threads). Same split and completion as ibgda: each unit puts its
-//              slice every iteration, then flushes (network mode) its own
-//              SPSC queue. Small sizes with -s warp and many blocks give the message rate
+//              slice every iteration, then flushes (network mode) its queue.
+//              -q spsc: one queue per unit; -q mpsc: one queue per block.
+//              Small sizes with -s warp and many blocks give the message rate
 //              (Mpps column).
 //
 // lsa/ibgda split the buffer into `nblocks` chunks (one per block); scope sets
@@ -117,9 +118,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 #ifdef MORI_CCO_PROXY
 // Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
 // iteration, then a network-mode flush waits until its puts completed (remote
-// ack) -- the counterpart of ibgda's trailing flush. Unit u of block b owns SPSC
-// queue b * nunits + u.
-template <typename Coop>
+// ack) -- the counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
+// queue b * nunits + u; MPSC: the block's units share queue b.
+template <typename Q, typename Coop>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -136,7 +137,7 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  ccoProxy<> proxy{devComm, bid * nunits + unit};
+  ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? bid * nunits + unit : bid};
   for (int i = 0; i < iter; i++) {
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
               reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
@@ -144,13 +145,14 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   proxy.template flush<ccoProxyFlushNetwork>(coop);
 }
 
+template <typename Q>
 static void launch_proxy(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
                          ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm, int count) {
   if (scope == PutScope::kWarp) {
-    hipLaunchKernelGGL((proxy_put_bw<ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
   } else {
-    hipLaunchKernelGGL((proxy_put_bw<ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
   }
 }
@@ -326,8 +328,13 @@ int main(int argc, char** argv) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (proxy) {
 #ifdef MORI_CCO_PROXY
-          launch_proxy(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, len_doubles,
-                       ctx.devComm, count);
+          if (args.proxy_mpsc) {
+            launch_proxy<kiwi::queue::MPSCD2HQueue>(args.put_scope, grid, block, ctx.send_win,
+                                                    ctx.recv_win, len_doubles, ctx.devComm, count);
+          } else {
+            launch_proxy<kiwi::queue::SPSCD2HQueue>(args.put_scope, grid, block, ctx.send_win,
+                                                    ctx.recv_win, len_doubles, ctx.devComm, count);
+          }
 #endif
         } else if (args.transport == Transport::kSdma) {
           launch_sdma(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,

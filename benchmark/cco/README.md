@@ -60,7 +60,9 @@ the proxy has seen every earlier put of the queue complete.
   - `-S` is the same ping-pong with bare signals.
 - `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, or wavefront with
   `-s warp`) puts its slice every iteration, then does one network flush per
-  launch, as ibgda does with `flush`. Every unit has its own SPSC queue.
+  launch, as ibgda does with `flush`.
+  - `-q spsc` (default) gives every unit its own SPSC queue; `-q mpsc` shares
+    one MPSC queue per block.
   - `-Q` sets the number of host proxy threads (default 4).
 - Message rate: run small sizes with `-s warp` and many wavefronts. The `Mpps`
   column gives the per-message issue rate.
@@ -79,6 +81,7 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_latency -t proxy -S -s warp -n 1000 -
 mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -Q 4 -c 32 -T 256 -s block -b 64K -e 256M -n 200
 # message rate: 32 blocks x 4 wavefronts = 128 SPSC queues, 8 B..4 KiB per message
 mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -Q 4 -c 32 -T 256 -s warp -b 1K -e 512K -n 2000
+mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -q mpsc -Q 4 -c 32 -T 256 -s warp -b 1K -e 512K -n 2000
 ```
 
 ## Triton benchmark

@@ -246,6 +246,11 @@ int main(int argc, char** argv) {
     PerfFinalize(&ctx);
     return 1;
   }
+  if (args.proxy_mpsc) {
+    if (my_pe == 0) std::fprintf(stderr, "-q mpsc is cco_p2p_put_bw only\n");
+    PerfFinalize(&ctx);
+    return 1;
+  }
   if (args.pingpong) {
     const bool rdma = args.transport == Transport::kIbgda || args.transport == Transport::kProxy;
     const bool scope_ok = args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
