@@ -38,13 +38,22 @@
 //                  (per-(queue, peer) ordering)
 //   win_signal     put carrying WindowSignalAdd into a caller flag window
 //   large_put      one 4 MiB put per peer on a single queue
-//   kiwi_flush     put, kiwi-mode flush (checks flushDone covers the puts), then
-//                  signal
+//   kiwi_flush     put, kiwi-mode flush (checks it advanced flushDone by
+//                  exactly one), then signal
 //   net_flush      put, network-mode flush, overwrite the source right away,
 //                  then signal: the peer must still see the original data
 //   mpsc_put_sig   put_sig_warp on the MPSC pool, 4 blocks per queue pushing
 //                  concurrently
 //   mpsc_then_sig  put_then_sig on the MPSC pool, 4 blocks per queue
+//   mpsc_flush     net_flush on the MPSC pool, 4 blocks per queue flushing
+//                  concurrently
+//   mpsc_stress    kStressBlocks x kStressWarps wavefronts on one MPSC queue,
+//                  each doing kStressRounds rounds of put + flush, mixing
+//                  kiwi- and network-mode flushes. After each network flush a
+//                  wavefront overwrites the sources of every put since its
+//                  previous network flush. Ticket fetch-adds and FLUSH claims
+//                  are separate atomics, so under this contention FLUSHes can
+//                  land in the ring out of ticket order.
 //   signal_only    every queue sends kSignalRounds SignalAdd{u+1} to one
 //                  contended slot on every peer; total checked via waitSignal
 //
@@ -67,6 +76,10 @@ static constexpr int kMaxUnits = 8;
 static constexpr size_t kChunk = 64 * 1024;
 static constexpr size_t kLargeChunk = 4 * 1024 * 1024;
 static constexpr int kSignalRounds = 16;
+static constexpr int kStressBlocks = 8;
+static constexpr int kStressWarps = 4;  // wavefronts per block
+static constexpr int kStressRounds = 8;
+static constexpr size_t kStressChunk = 16 * 1024;
 static constexpr uint32_t kClobber = 0xdeadbeefu;
 
 enum PutMode {
@@ -115,13 +128,18 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
     }
   }
   if constexpr (Mode == kPutKiwiFlush) {
+    uint64_t before = 0;
+    if constexpr (ccoProxy<Q>::kSpsc) {
+      before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
     proxy.template flush<ccoProxyFlushKiwi>(Coop{});
     if constexpr (ccoProxy<Q>::kSpsc) {
-      // flushDone covers the FLUSH, which sits after every put of this queue.
-      if (threadIdx.x == 0 &&
-          __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) <
-              proxy.handle.queue.producer_index) {
-        printf("[rank %d] kiwi_flush: unit %d flushDone behind the queue\n", me, u);
+      // This wavefront owns the queue: its FLUSH is the only one in flight.
+      const uint64_t after =
+          __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      if (threadIdx.x == 0 && after != before + 1) {
+        printf("[rank %d] kiwi_flush: unit %d flushDone %llu -> %llu\n", me, u,
+               (unsigned long long)before, (unsigned long long)after);
         atomicExch(err, 1);
       }
     }
@@ -151,6 +169,63 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
       } else {
         proxy.waitSignal(Slot(s, u), 1);
       }
+    }
+  }
+}
+
+// Every wavefront w (of kStressBlocks x kStressWarps) shares MPSC queue 0. In
+// round r it puts unit u = w * kStressRounds + r to every peer, then flushes:
+// network mode in the last round and in two of every three others, kiwi mode
+// otherwise. A network flush covers every earlier put of the wavefront, so it
+// then overwrites the sources of all units since its previous network flush.
+// Finally each wavefront adds 1 to `slot` on every peer, and block 0 waits for
+// every peer's wavefronts.
+__global__ void ProxyStressKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                                  uint32_t* sendLocal, ccoGdaSignal_t slot, int* err) {
+  const int lane = __lane_id();
+  const int waveSize = __builtin_amdgcn_wavefrontsize();
+  const int w = blockIdx.x * (blockDim.x / waveSize) + threadIdx.x / waveSize;
+  const int nWaves = gridDim.x * (blockDim.x / waveSize);
+  const int nUnits = nWaves * kStressRounds;
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  ccoProxy<MPSCD2HQueue> proxy{dc, 0};
+  auto off = [&](int rank, int u) {
+    return (static_cast<size_t>(rank) * nUnits + u) * kStressChunk;
+  };
+  int clean = 0;  // first round whose sources are not yet overwritten
+  for (int r = 0; r < kStressRounds; r++) {
+    const int u = w * kStressRounds + r;
+    for (int p = 0; p < n; p++) {
+      if (p != me) {
+        proxy.put(p, recvWin, off(me, u), sendWin, off(p, u), kStressChunk, ccoGda_NoSignal{},
+                  ccoCoopWarp{});
+      }
+    }
+    if (r == kStressRounds - 1 || (w + r) % 3 != 2) {
+      proxy.flush<ccoProxyFlushNetwork>(ccoCoopWarp{});
+      for (int k = w * kStressRounds + clean; k <= u; k++) {
+        for (int p = 0; p < n; p++) {
+          if (p == me) continue;
+          uint32_t* src = sendLocal + off(p, k) / sizeof(uint32_t);
+          for (size_t i = lane; i < kStressChunk / sizeof(uint32_t); i += waveSize)
+            src[i] = kClobber;
+        }
+      }
+      __threadfence_system();
+      clean = r + 1;
+    } else {
+      proxy.flush<ccoProxyFlushKiwi>(ccoCoopWarp{});
+    }
+  }
+  for (int p = 0; p < n; p++) {
+    if (p != me) proxy.signal(p, ccoGda_SignalAdd{slot, 1}, ccoCoopWarp{});
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    proxy.waitSignal(slot, static_cast<uint64_t>(nWaves) * (n - 1));
+    if (proxy.readSignal(slot) != 0) {
+      printf("[rank %d] mpsc_stress: extra signals\n", me);
+      atomicExch(err, 1);
     }
   }
 }
@@ -265,6 +340,17 @@ static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int
   return c.Verify(name, salt, chunk, nUnits);
 }
 
+static int RunStressCase(Ctx& c) {
+  const int nWaves = kStressBlocks * kStressWarps;
+  const int nUnits = nWaves * kStressRounds;
+  c.Fresh(/*salt=*/10, kStressChunk, nUnits);
+  ProxyStressKernel<<<kStressBlocks, kStressWarps * 64, 0, c.stream>>>(
+      c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf),
+      static_cast<ccoGdaSignal_t>(c.nSlots - 1), c.dErr);
+  c.Sync();
+  return c.Verify("mpsc_stress", 10, kStressChunk, nUnits);
+}
+
 static int RunSignalCase(Ctx& c) {
   c.Fresh(/*salt=*/0, kChunk, kSpscQueues);
   const ccoGdaSignal_t slot = static_cast<ccoGdaSignal_t>(c.nSlots - 1);
@@ -290,7 +376,8 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   }
 
   // One buffer size covers every chunk layout used below.
-  c.bufSize = std::max(nranks * kMaxUnits * kChunk, nranks * kLargeChunk);
+  c.bufSize = std::max({nranks * kMaxUnits * kChunk, nranks * kLargeChunk,
+                        nranks * kStressBlocks * kStressWarps * kStressRounds * kStressChunk});
   c.nSlots = nranks * kMaxUnits + 1;  // per (sender, unit) + one contended slot
   if (ccoWindowRegister(c.comm, c.bufSize, &c.sendWin, &c.sendBuf) != 0 ||
       ccoWindowRegister(c.comm, c.bufSize, &c.recvWin, &c.recvBuf) != 0 ||
@@ -339,6 +426,9 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                              kMaxUnits, 64);
   fails += RunPutCase<MPSCD2HQueue, ccoCoopBlock, kPutThenSignal>(c, "mpsc_then_sig", 8, kChunk,
                                                                   kMaxUnits, 256);
+  fails += RunPutCase<MPSCD2HQueue, ccoCoopBlock, kPutNetFlushClobber>(c, "mpsc_flush", 9, kChunk,
+                                                                       kMaxUnits, 256);
+  fails += RunStressCase(c);
   fails += RunSignalCase(c);
 
   HIP_CHECK(hipStreamDestroy(c.stream));

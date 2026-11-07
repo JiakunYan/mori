@@ -36,13 +36,13 @@
 // (completedSeq). Every WR is signaled (v1). SQ credit is postedSeq -
 // completedSeq.
 //
-// Flush: each queue tracks its consumed position (lines) and, per peer, the
-// sequence of the last WR it produced. A FLUSH popped at position P (just past
-// the FLUSH) first posts every pending WR, then becomes a pending flush: kiwi
-// mode waits for nothing, network mode for this queue's last WR on every peer
-// that still has work outstanding.
+// Flush: each queue tracks, per peer, the sequence of the last WR it produced.
+// A popped FLUSH first posts every pending WR, then becomes a pending flush:
+// kiwi mode waits for nothing, network mode for this queue's last WR on every
+// peer that still has work outstanding.
 // Pending flushes retire in FIFO order, so a kiwi FLUSH behind a network FLUSH
-// waits for it; retiring one publishes flushDone[q] = P.
+// waits for it; each retired FLUSH adds 1 to flushDone[q]. The GPU side turns
+// that count into "my FLUSH is satisfied" (see cco_proxy.hpp).
 
 // cco headers first: core/utils.hpp (pulled in by the application headers)
 // defines a `warpSize` macro that would break cco.hpp's impl::warpSize().
@@ -216,14 +216,13 @@ class HostQueueImpl final : public HostQueue {
 };
 
 struct PendingFlush {
-  uint64_t pos;                                 // flushDone value once retired
   std::vector<std::pair<int, uint64_t>> waits;  // (peer, WR seq) that must complete
 };
 
 struct OwnedQueue {
   std::unique_ptr<HostQueue> queue;
-  volatile uint64_t* flushDone{nullptr};  // SPSC: fine-grained device memory, host-written
-  uint64_t pos{0};                        // lines consumed (KIWI messages never pad)
+  volatile uint64_t* flushDone{nullptr};  // fine-grained device memory, host-written
+  uint64_t flushed{0};                    // FLUSHes retired (the value of *flushDone)
   std::vector<uint64_t> lastSeq;          // [worldSize] seq of the last WR this queue produced
   std::deque<PendingFlush> pending;
 };
@@ -283,16 +282,12 @@ class ProxyWorker {
 
  private:
   // A callback runs on the proxy thread that called progress(), for the queue
-  // in its cur_. Before the callback proper, it advances that queue's position
-  // past its message (KIWI messages never pad).
+  // in its cur_.
   template <typename Q, typename Desc>
   static void Register(kiwi::invoke::Context<Q>& ctx, ccoProxyOp op,
                        void (ProxyWorker::*fn)(const Desc&)) {
-    const uint8_t id = ctx.register_callback(std::function<void(Desc)>([fn](Desc d) {
-      ProxyWorker* w = current_;
-      w->cur_->pos += kiwi::queue::message_lines(sizeof(Desc));
-      (w->*fn)(d);
-    }));
+    const uint8_t id =
+        ctx.register_callback(std::function<void(Desc)>([fn](Desc d) { (current_->*fn)(d); }));
     if (id != op) throw std::runtime_error("ccoProxy callback id mismatch");
   }
 
@@ -366,11 +361,10 @@ class ProxyWorker {
 
   void OnFlush(const ccoProxyFlushDesc& d) {
     OwnedQueue& oq = *cur_;
-    if (oq.flushDone == nullptr) ProxyFatal(id_, "FLUSH on an MPSC queue");
     // Everything before the FLUSH is popped; post it too, so even a kiwi
     // FLUSH means "handed to the NIC".
     for (int p : activePeers_) PostChain(qps[p]);
-    PendingFlush f{oq.pos, {}};
+    PendingFlush f;
     if (d.mode == ccoProxyFlushNetwork) {
       for (int p : activePeers_) {
         if (oq.lastSeq[p] > qps[p].completedSeq) f.waits.emplace_back(p, oq.lastSeq[p]);
@@ -382,20 +376,21 @@ class ProxyWorker {
     RetireFlushes(oq);
   }
 
-  // Retire satisfied flushes in FIFO order and publish the newest position.
+  // Retire satisfied flushes in FIFO order and publish the new count.
   void RetireFlushes(OwnedQueue& oq) {
-    uint64_t done = 0;
+    uint64_t retired = 0;
     while (!oq.pending.empty()) {
       const PendingFlush& f = oq.pending.front();
       const bool satisfied = std::all_of(f.waits.begin(), f.waits.end(), [&](const auto& w) {
         return qps[w.first].completedSeq >= w.second;
       });
       if (!satisfied) break;
-      done = f.pos;
+      retired++;
       oq.pending.pop_front();
     }
-    if (done != 0) {
-      __atomic_store_n(oq.flushDone, done, __ATOMIC_RELEASE);
+    if (retired != 0) {
+      oq.flushed += retired;
+      __atomic_store_n(oq.flushDone, oq.flushed, __ATOMIC_RELEASE);
       _mm_sfence();  // drain the write-combining buffer toward the device
     }
   }
@@ -508,6 +503,7 @@ class ccoProxyEngine {
     ibv.reset();  // deregisters the scratch MR; leaves the borrowed PD alone
     free(scratch);
     if (flushDone) (void)hipFree(flushDone);
+    if (flushTicket) (void)hipFree(flushTicket);
   }
 
   void StopAndJoin() {
@@ -522,7 +518,8 @@ class ccoProxyEngine {
   std::vector<std::unique_ptr<OwnedQueue>> queues;  // SPSC pool, then MPSC pool
   std::vector<std::unique_ptr<ProxyWorker>> workers;
   void* scratch{nullptr};
-  uint64_t* flushDone{nullptr};  // fine-grained device [numSpsc]
+  uint64_t* flushDone{nullptr};    // fine-grained device [numSpsc + numMpsc]
+  uint64_t* flushTicket{nullptr};  // device [numMpsc]
   std::atomic<bool> stop{false};
 };
 
@@ -581,15 +578,20 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       engine->workers.push_back(std::move(w));
     }
 
-    // SPSC flushDone: fine-grained device memory (the GPU polls it locally, the
-    // proxy writes it over PCIe).
-    if (numSpsc > 0) {
-      HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
-                                       sizeof(uint64_t) * numSpsc, hipDeviceMallocFinegrained),
-                 "hipExtMallocWithFlags");
-      HipOrThrow(hipMemset(engine->flushDone, 0, sizeof(uint64_t) * numSpsc), "hipMemset");
-      HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
+    // flushDone: fine-grained device memory (the GPU polls it locally, the
+    // proxy writes it over PCIe). MPSC flush tickets: plain device memory, only
+    // touched by GPU atomics.
+    HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
+                                     sizeof(uint64_t) * numQueues, hipDeviceMallocFinegrained),
+               "hipExtMallocWithFlags");
+    HipOrThrow(hipMemset(engine->flushDone, 0, sizeof(uint64_t) * numQueues), "hipMemset");
+    if (numMpsc > 0) {
+      HipOrThrow(
+          hipMalloc(reinterpret_cast<void**>(&engine->flushTicket), sizeof(uint64_t) * numMpsc),
+          "hipMalloc");
+      HipOrThrow(hipMemset(engine->flushTicket, 0, sizeof(uint64_t) * numMpsc), "hipMemset");
     }
+    HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
 
     // One invoke context per pool. Queues: SPSC pool [0, numSpsc), MPSC pool
     // [numSpsc, numQueues); queue g is consumed by thread g % numThreads.
@@ -605,12 +607,12 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     }
     for (int g = 0; g < numQueues; g++) {
       auto oq = std::make_unique<OwnedQueue>();
+      oq->flushDone = engine->flushDone + g;
       if (g < numSpsc) {
         oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::SPSCD2HQueue>>(*engine->spsc, g);
-        oq->flushDone = engine->flushDone + g;
       } else {
-        oq->queue = std::make_unique<HostQueueImpl<kiwi::queue::MPSCD2HQueue>>(*engine->mpsc,
-                                                                              g - numSpsc);
+        oq->queue =
+            std::make_unique<HostQueueImpl<kiwi::queue::MPSCD2HQueue>>(*engine->mpsc, g - numSpsc);
       }
       oq->lastSeq.assign(worldSize, 0);
       engine->workers[g % numThreads]->queues.push_back(oq.get());
@@ -660,6 +662,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;
   out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
   out->flushDone = engine->flushDone;
+  out->flushTicket = engine->flushTicket;
   out->engine = engine.get();
   return engine.release();
 }

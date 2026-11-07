@@ -48,13 +48,22 @@
 // DevComm whose gdaConnectionType resolves to non-NONE (FULL / RAIL /
 // CROSSNODE).
 //
-// flush<Mode>() pushes a FLUSH descriptor at queue position P and spins until
-// the proxy has published flushDone >= P:
+// flush<Mode>() pushes a FLUSH descriptor and waits until the proxy has
+// satisfied it (or a later FLUSH of the same queue):
 //   ccoProxyFlushKiwi (default): everything before the FLUSH in this queue has
 //     been popped and posted. Source buffers are NOT yet reusable.
 //   ccoProxyFlushNetwork: additionally every work request this queue posted
 //     before the FLUSH has completed (remote ack): source buffers are reusable.
 // flush(peer) is flush() (covers every peer).
+//
+// Flush counting: the proxy satisfies each queue's FLUSHes in queue order and
+// adds 1 to that queue's flushDone per FLUSH satisfied (it is the only writer).
+// A flush never needs its FLUSH's ring position:
+//   SPSC: the calling wavefront owns the queue and every earlier FLUSH on it has
+//     been waited for, so v = flushDone before the push is exact and our FLUSH
+//     is satisfied once flushDone >= v + 1.
+//   MPSC: the caller takes a ticket t from the queue's flushTicket counter right
+//     before pushing, and waits for flushDone >= t (see flush()).
 //
 // put / signal / flush are called by the whole Coop group, and every thread
 // must pass the same arguments: the KIWI push is wavefront-collective and lane
@@ -63,13 +72,9 @@
 //
 // Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
 //
-// Current limits, both pending KIWI queue APIs:
-//   - Coop must be ccoCoopWarp or ccoCoopBlock: a KIWI push is
-//     wavefront-collective (all 64 lanes). ccoCoopThread needs a per-thread
-//     push (push_thread()).
-//   - flush() is SPSC only. On an MPSC queue the producer cannot tell where
-//     its FLUSH landed in the shared ring; that needs a push that reports the
-//     end of its claimed lines (push_lanes_end()).
+// Current limit, pending a KIWI queue API: Coop must be ccoCoopWarp or
+// ccoCoopBlock, since a KIWI push is wavefront-collective (all 64 lanes).
+// ccoCoopThread needs a per-thread push (push_thread()).
 
 #pragma once
 
@@ -97,7 +102,7 @@ enum ccoProxyOp : uint8_t {
   ccoProxyOpPut = 0,        // ccoProxyPutDesc: RDMA write
   ccoProxyOpPutSignal = 1,  // ccoProxyPutSignalDesc: RDMA write + atomic add, same QP
   ccoProxyOpSignal = 2,     // ccoProxySignalDesc: atomic add
-  ccoProxyOpFlush = 3,      // ccoProxyFlushDesc: publish flushDone
+  ccoProxyOpFlush = 3,      // ccoProxyFlushDesc: flushDone += 1 once satisfied
   ccoProxyOpCount
 };
 
@@ -187,9 +192,10 @@ struct ccoProxy {
   int rank;    // my index in the GDA team [0, nRanks)
   int nRanks;  // GDA team size, as ccoGda
   uint32_t queueId;
-  DeviceContext* ctx;   // this pool's invoke context
-  uint64_t* flushDone;  // SPSC: this queue's flushDone (fine-grained device memory)
-  bool dirty;           // SPSC: pushed since the handle was loaded / saved
+  DeviceContext* ctx;     // this pool's invoke context
+  uint64_t* flushDone;    // this queue's satisfied-FLUSH count (fine-grained device memory)
+  uint64_t* flushTicket;  // MPSC: this queue's flush ticket counter (device memory)
+  bool dirty;             // SPSC: pushed since the handle was loaded / saved
   typename DeviceContext::DeviceHandle handle;
 
   // queueIndex is taken modulo the pool size, like ccoGda's contextIndex.
@@ -311,7 +317,7 @@ struct ccoProxy {
 
 template <typename Queue>
 __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIndex)
-    : comm(comm_), ctx(nullptr), flushDone(nullptr), dirty(false) {
+    : comm(comm_), ctx(nullptr), flushDone(nullptr), flushTicket(nullptr), dirty(false) {
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
       rank = comm.rank;
@@ -336,7 +342,9 @@ __device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIn
   if (poolSize > 0) {
     ctx = static_cast<DeviceContext*>(kSpsc ? comm.proxy.spscContext : comm.proxy.mpscContext);
     handle = ctx->get_device_handle(queueId);
-    if constexpr (kSpsc) flushDone = comm.proxy.flushDone + queueId;
+    // flushDone: SPSC pool, then MPSC pool.
+    flushDone = comm.proxy.flushDone + (kSpsc ? 0 : comm.proxy.numSpscQueues) + queueId;
+    if constexpr (!kSpsc) flushTicket = comm.proxy.flushTicket + queueId;
   }
 }
 
@@ -391,20 +399,46 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
 template <typename Queue>
 template <ccoProxyFlushMode Mode, typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
 __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
-  static_assert(kSpsc,
-                "ccoProxy<MPSCD2HQueue>::flush is not available yet: it needs the position of its "
-                "FLUSH in the shared ring, which needs a KIWI MPSC push that reports it "
-                "(push_lanes_end()). Use the SPSC pool to flush.");
   coop.sync();
   if (issuingWave<Coop>()) {
+    // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
+    // that covers it) is satisfied.
+    uint64_t target = 0;
+    if (__lane_id() == 0) {
+      if constexpr (kSpsc) {
+        // Acquire: the load completes before the FLUSH push below, so it cannot
+        // already count our own FLUSH.
+        target = __hip_atomic_load(flushDone, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) + 1;
+      } else {
+        // Ticket t: we wait for flushDone >= t, i.e. for the first t FLUSHes of
+        // this queue (in queue order) to be satisfied. Those t FLUSHes hold t
+        // distinct tickets, so at least one of them holds a ticket t' >= t: ours
+        // (t' == t), or one whose caller took its ticket after us (t' > t).
+        // That FLUSH was claimed after our puts, so it covers them: kiwi mode
+        // retires FLUSHes in queue order after everything before them, and
+        // network mode snapshots the queue's last WR per QP when it pops the
+        // FLUSH.
+        //
+        // Why that FLUSH was claimed after our puts: every ticket fetch-add is
+        // acq_rel (agent scope: all producers of a queue run on this GPU). The
+        // later caller's fetch-add reads ours (or a later RMW of the same
+        // release sequence), so our release synchronizes with its acquire:
+        // our put claims (relaxed fetch-adds on the ring's producer index,
+        // earlier in program order) happen before its ticket, which comes
+        // before its FLUSH claim in program order (and, by the acquire, is
+        // complete before that claim issues). Coherence on the producer index
+        // then puts our puts earlier in the ring. seq_cst would add nothing:
+        // the argument uses only this one release/acquire pair per caller.
+        target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_ACQ_REL,
+                                        __HIP_MEMORY_SCOPE_AGENT) +
+                 1;
+      }
+    }
     ccoProxyFlushDesc d{};
     d.mode = Mode;
     invoke(ccoProxyOpFlush, d);
-    // Position just past our FLUSH; flushDone reaches it only once the proxy
-    // has satisfied this FLUSH (it retires flushes in queue order).
-    const uint64_t pos = handle.queue.producer_index;
     if (__lane_id() == 0) {
-      while (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < pos) {
+      while (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
         __builtin_amdgcn_s_sleep(1);
       }
     }

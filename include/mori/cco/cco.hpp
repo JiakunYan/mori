@@ -388,10 +388,13 @@ struct ccoProxyContext {
   int numMpscQueues;
   void* spscContext;  // GPU kiwi::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC queues
   void* mpscContext;  // GPU kiwi::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC queues
-  // [numSpscQueues] queue position (lines) just past the last FLUSH the proxy
-  // has satisfied. Fine-grained device memory, written only by the proxy,
-  // never decreases.
+  // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
+  // proxy has satisfied per queue. Fine-grained device memory, written only by
+  // the proxy, never decreases.
   uint64_t* flushDone;
+  // [numMpscQueues] flush tickets taken per MPSC queue. Device memory, written
+  // only by kernels (atomic fetch-add), never decreases.
+  uint64_t* flushTicket;
   void* engine;  // host-only ccoProxyEngine*, opaque to kernels
 };
 
