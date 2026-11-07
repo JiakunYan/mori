@@ -63,6 +63,11 @@
 //                  FLUSHes can land in the ring out of ticket order.
 //   signal_only    every queue sends kSignalRounds SignalAdd{u+1} to one
 //                  contended slot on every peer; total checked via waitSignal
+//   spsc_handoff   in-kernel SPSC handoff: wavefront 0 puts half the chunk,
+//                  flushes and release()s; after __syncthreads() wavefront 1
+//                  constructs a ccoProxy on the same queue, puts the other half
+//                  carrying SignalInc and flushes; flushDone must advance by
+//                  exactly 2
 //   small_spsc,    on a second DevComm whose rings hold kSmallCapacity lines:
 //   small_mpsc     each unit sends its chunk as kPieces puts per peer (the
 //                  last carrying the signal), so every ring wraps many times
@@ -295,6 +300,52 @@ __global__ void ProxySignalKernel(ccoDevComm dc, ccoGdaSignal_t slot, int* err) 
   }
 }
 
+// One block of two wavefronts, unit 0 on SPSC queue 0, handed from wavefront 0
+// to wavefront 1 (the release() / __syncthreads() handoff in cco_proxy.hpp).
+__global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                                   size_t chunk, int* err) {
+  __shared__ uint64_t before;
+  const int wave = threadIdx.x / __builtin_amdgcn_wavefrontsize();
+  const int me = dc.rank;
+  const int n = dc.worldSize;
+  const size_t half = chunk / 2;
+  uint64_t* flushDone = dc.proxy.flushDone;  // SPSC queue 0
+  if (wave == 0) {
+    if (threadIdx.x == 0) {
+      before = __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    ccoProxy<> proxy{dc, 0};
+    for (int p = 0; p < n; p++) {
+      if (p != me) proxy.put(p, recvWin, me * chunk, sendWin, p * chunk, half);
+    }
+    proxy.flush();
+    proxy.release();
+  }
+  __syncthreads();
+  if (wave == 1) {
+    ccoProxy<> proxy{dc, 0};
+    for (int p = 0; p < n; p++) {
+      if (p != me) {
+        proxy.put(p, recvWin, me * chunk + half, sendWin, p * chunk + half, chunk - half,
+                  ccoGda_SignalInc{Slot(me, 0)});
+      }
+    }
+    proxy.flush();
+    const uint64_t after =
+        __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (__lane_id() == 0) {
+      if (after != before + 2) {
+        printf("[rank %d] spsc_handoff: flushDone %llu -> %llu, want +2\n", me,
+               (unsigned long long)before, (unsigned long long)after);
+        atomicExch(err, 1);
+      }
+      for (int s = 0; s < n; s++) {
+        if (s != me) proxy.waitSignal(Slot(s, 0), 1);
+      }
+    }
+  }
+}
+
 __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
   ccoProxy<> proxy{dc, 0};  // no push: reads the slots' signal state only
   for (int i = threadIdx.x; i < nSlots; i += blockDim.x) {
@@ -400,6 +451,13 @@ static int RunStressCase(Ctx& c) {
   return c.Verify("mpsc_stress", 10, kStressChunk, nUnits);
 }
 
+static int RunHandoffCase(Ctx& c) {
+  c.Fresh(c.dc, /*salt=*/16, kChunk, /*nUnits=*/1);
+  ProxyHandoffKernel<<<1, 128, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, c.dErr);
+  c.Sync();
+  return c.Verify("spsc_handoff", 16, kChunk, 1);
+}
+
 static int RunSignalCase(Ctx& c) {
   c.Fresh(c.dc, /*salt=*/0, kChunk, kSpscQueues);
   const ccoGdaSignal_t slot = static_cast<ccoGdaSignal_t>(c.nSlots - 1);
@@ -489,6 +547,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                      kMaxUnits, 256);
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
+  fails += RunHandoffCase(c);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_spsc", 14, kChunk,
                                                              kSpscQueues, 64, true);
   fails += RunPutCase<MPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_mpsc", 15, kChunk, kMaxUnits,
