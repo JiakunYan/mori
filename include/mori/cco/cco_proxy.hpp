@@ -300,7 +300,7 @@ struct ccoProxy {
   // Invoke callback `op` with one descriptor (whole wavefront). An SPSC push on
   // a full ring retries; an MPSC push waits inside KIWI (and always succeeds).
   template <typename Desc>
-  __device__ inline void push(ccoProxyOp op, const Desc& desc) {
+  __device__ inline void invoke(ccoProxyOp op, const Desc& desc) {
     if constexpr (kSpsc) {
       while (!handle.invoke(op, desc)) {
         __builtin_amdgcn_s_sleep(1);
@@ -311,12 +311,13 @@ struct ccoProxy {
     }
   }
 
-  // Data-carrying push: make the source data (and any earlier stores the peer
-  // will read) visible to the NIC before the proxy can post the WR.
+  // invoke() for a data-carrying op: first make the source data (and any earlier
+  // stores the peer will read) visible to the NIC, since the proxy may post the
+  // WR as soon as the descriptor lands.
   template <typename Desc>
-  __device__ inline void pushOp(ccoProxyOp op, const Desc& desc) {
+  __device__ inline void fenceAndInvoke(ccoProxyOp op, const Desc& desc) {
     impl::threadFenceSystem();
-    push(op, desc);
+    invoke(op, desc);
   }
 };
 
@@ -378,19 +379,19 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
     // Split transfers one WR cannot carry; the signal rides the last piece.
     while (bytes > ccoProxyMaxPutBytes) {
       d.bytes = static_cast<uint32_t>(ccoProxyMaxPutBytes);
-      pushOp(ccoProxyOpPut, d);
+      fenceAndInvoke(ccoProxyOpPut, d);
       d.laddr += ccoProxyMaxPutBytes;
       d.raddr += ccoProxyMaxPutBytes;
       bytes -= ccoProxyMaxPutBytes;
     }
     d.bytes = static_cast<uint32_t>(bytes);
     if constexpr (std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
-      pushOp(ccoProxyOpPut, d);
+      fenceAndInvoke(ccoProxyOpPut, d);
     } else {
       ccoProxyPutSignalDesc ds{};
       ds.put = d;
       ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
-      pushOp(ccoProxyOpPutSignal, ds);
+      fenceAndInvoke(ccoProxyOpPutSignal, ds);
     }
   }
   coop.sync();
@@ -405,7 +406,7 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
     peer = impl::proxyBroadcast(peer);
     remoteAction = impl::proxyBroadcast(remoteAction);
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
-    pushOp(ccoProxyOpSignal, impl::proxyResolveSignal(comm, worldPeer, remoteAction));
+    fenceAndInvoke(ccoProxyOpSignal, impl::proxyResolveSignal(comm, worldPeer, remoteAction));
   }
   coop.sync();
 }
@@ -421,7 +422,7 @@ __device__ inline void ccoProxy<Queue>::flush(Coop coop) {
   if (issuingWave<Coop>()) {
     ccoProxyFlushDesc d{};
     d.mode = Mode;
-    push(ccoProxyOpFlush, d);
+    invoke(ccoProxyOpFlush, d);
     // Position just past our FLUSH; flushDone reaches it only once the proxy
     // has satisfied this FLUSH (it retires flushes in queue order).
     const uint64_t pos = handle.queue.producer_index;
