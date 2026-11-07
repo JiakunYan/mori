@@ -56,6 +56,11 @@
 //     before the FLUSH has completed (remote ack): source buffers are reusable.
 // flush(peer) is flush() (covers every peer).
 //
+// put / signal / flush are called by the whole Coop group, and every thread
+// must pass the same arguments: the KIWI push is wavefront-collective and lane
+// i writes word i of the descriptor, so per-lane arguments would mix fields
+// from different lanes. (ccoGda only reads thread_rank 0's arguments.)
+//
 // Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
 //
 // Current limits, both pending KIWI queue APIs:
@@ -138,23 +143,6 @@ inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
 #if defined(__HIPCC__)
 
 namespace impl {
-
-// Broadcast lane 0's copy of a trivially copyable value to the whole wavefront.
-// The KIWI push needs identical arguments on every lane; like ccoGda, the
-// lane-0 (thread_rank 0) arguments are the ones that count.
-template <typename T>
-__device__ inline T proxyBroadcast(const T& v) {
-  static_assert(std::is_trivially_copyable_v<T> && sizeof(T) % sizeof(uint32_t) == 0,
-                "proxyBroadcast needs a trivially copyable, 4-byte-multiple type");
-  struct Words {
-    uint32_t w[sizeof(T) / sizeof(uint32_t)];
-  };
-  Words words = __builtin_bit_cast(Words, v);
-  for (size_t i = 0; i < sizeof(T) / sizeof(uint32_t); i++) {
-    words.w[i] = __builtin_amdgcn_readfirstlane(words.w[i]);
-  }
-  return __builtin_bit_cast(T, words);
-}
 
 // Resolve a remote action to a signal descriptor, as ccoGda::put does.
 template <typename RemoteAction>
@@ -359,15 +347,6 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
                                             RemoteAction remoteAction, Coop coop) {
   coop.sync();
   if (issuingWave<Coop>()) {
-    peer = impl::proxyBroadcast(peer);
-    dstWin = impl::proxyBroadcast(dstWin);
-    srcWin = impl::proxyBroadcast(srcWin);
-    dstOffset = impl::proxyBroadcast(dstOffset);
-    srcOffset = impl::proxyBroadcast(srcOffset);
-    bytes = impl::proxyBroadcast(bytes);
-    if constexpr (!std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
-      remoteAction = impl::proxyBroadcast(remoteAction);
-    }
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     ccoProxyPutDesc d{};
@@ -403,8 +382,6 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
   static_assert(!std::is_same_v<RemoteAction, ccoGda_NoSignal>, "signal() needs a remote action");
   coop.sync();
   if (issuingWave<Coop>()) {
-    peer = impl::proxyBroadcast(peer);
-    remoteAction = impl::proxyBroadcast(remoteAction);
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
     fenceAndInvoke(ccoProxyOpSignal, impl::proxyResolveSignal(comm, worldPeer, remoteAction));
   }
