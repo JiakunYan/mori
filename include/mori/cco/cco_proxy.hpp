@@ -211,6 +211,8 @@ __device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, 
 //   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
 //             ccoCoopLaneMasked{i < n});
 // As a group it is a single thread (thread_rank 0, size 1, no-op sync).
+// ccoProxy only: other transports such as ccoGda accept it as a Coop but
+// ignore `active`, so every lane would issue its op there.
 struct ccoCoopLaneMasked {
   bool active = true;
   __device__ int thread_rank() const { return 0; }
