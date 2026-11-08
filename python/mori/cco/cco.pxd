@@ -80,6 +80,16 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         uint64_t* signalBuf
         uint64_t** peerSignalPtrs
 
+    cdef struct ccoProxyContext:
+        int numSpscQueues
+        int numMpscQueues
+        void* spscContext
+        void* mpscContext
+        uint64_t* flushDone
+        uint64_t* flushTicket
+        uint64_t maxPutBytes
+        void* engine
+
     cdef struct ccoDevCommRequirements:
         size_t size
         uint32_t magic
@@ -95,6 +105,10 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         int railGdaBarrierCount
         int sdmaQueueCount
         int barrierCount
+        int proxySpscQueueCount
+        int proxyMpscQueueCount
+        int proxyThreadCount
+        int proxyQueueCapacity
 
     cdef struct ccoDevComm:
         int rank
@@ -114,6 +128,7 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         ccoLsaBarrierHandle hybridLsaBarrier
         ccoGdaBarrierHandle hybridRailGdaBarrier
         ccoSdmaContext sdma
+        ccoProxyContext proxy
 
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,

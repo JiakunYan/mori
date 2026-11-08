@@ -36,10 +36,11 @@ namespace mori::cco::benchmark {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
-               "  -t transport   lsa | sdma | ibgda (default ibgda)\n"
+               "  -t transport   lsa | sdma | ibgda | proxy (default ibgda)\n"
                "                 sets the required env internally:\n"
                "                   sdma  -> MORI_ENABLE_SDMA=1\n"
                "                   ibgda -> MORI_DISABLE_P2P=1\n"
+               "                   proxy -> MORI_DISABLE_P2P=1 (ccoProxy, BUILD_CCO_PROXY)\n"
                "                   lsa   -> MORI_DISABLE_P2P=0\n"
                "                 when -t is omitted the transport falls back to env:\n"
                "                   MORI_ENABLE_SDMA=1 -> sdma  [highest priority]\n"
@@ -64,6 +65,13 @@ void PrintUsage(const char* program) {
                "                 without ringing, then one commit() (bw only)\n"
                "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
                "                 baseline rings each, -a rings once for all\n"
+               "  -P             latency: ping-pong put + SignalInc, both PEs run,\n"
+               "                 latency = round trip / 2 (ibgda, proxy)\n"
+               "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
+               "  -Q threads     proxy: host proxy threads (default 4)\n"
+               "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
+               "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
+               "                 block)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -95,7 +103,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -104,6 +112,25 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         break;
       case 'A':
         out_args->agg_depth = std::atoi(optarg);
+        break;
+      case 'P':
+        out_args->pingpong = true;
+        break;
+      case 'S':
+        out_args->pingpong = true;
+        out_args->signal_only = true;
+        break;
+      case 'Q':
+        out_args->proxy_threads = std::atoi(optarg);
+        break;
+      case 'q':
+        if (std::strcmp(optarg, "spsc") == 0) {
+          out_args->proxy_mpsc = false;
+        } else if (std::strcmp(optarg, "mpsc") == 0) {
+          out_args->proxy_mpsc = true;
+        } else {
+          return 1;
+        }
         break;
       case 'b':
         out_args->min_size = parse_size(optarg);
@@ -135,6 +162,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->transport = Transport::kSdma;
         } else if (std::strcmp(optarg, "ibgda") == 0) {
           out_args->transport = Transport::kIbgda;
+        } else if (std::strcmp(optarg, "proxy") == 0) {
+          out_args->transport = Transport::kProxy;
         } else {
           return 1;
         }
@@ -276,11 +305,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
-      args.threads_per_block < 1 || args.agg_depth < 1) {
+      args.threads_per_block < 1 || args.agg_depth < 1 || args.proxy_threads < 1) {
     if (ctx->world_rank == 0) {
       std::fprintf(stderr,
                    "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2, "
-                   "agg_depth >= 1).\n");
+                   "agg_depth >= 1, proxy threads >= 1).\n");
     }
     MPI_Finalize();
     return 1;
@@ -300,6 +329,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
         setenv("MORI_ENABLE_SDMA", "1", 1);
         break;
       case Transport::kIbgda:
+      case Transport::kProxy:
         setenv("MORI_ENABLE_SDMA", "0", 1);
         setenv("MORI_DISABLE_P2P", "1", 1);
         break;
@@ -400,9 +430,28 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // QP, so blocks are independent — no cross-block barrier, and each block
     // flushes its own QP. gdaContextCount must cover the largest block count.
     reqs.gdaContextCount = args.nblocks;
-    reqs.gdaSignalCount = 0;
+    // A few slots for the ping-pong latency kernels (kSlotPing).
+    reqs.gdaSignalCount = kBenchSignalCount;
     reqs.gdaCounterCount = 0;
     reqs.lsaBarrierCount = 0;
+    if (args.transport == Transport::kProxy) {
+#ifndef MORI_CCO_PROXY
+      if (ctx->my_pe == 0) {
+        std::fprintf(stderr, "-t proxy needs a mori build with BUILD_CCO_PROXY=ON\n");
+      }
+      PerfFinalize(ctx);
+      return 1;
+#endif
+      reqs.gdaContextCount = 1;  // GDA QPs unused; ccoProxy only borrows the signal slots
+      if (args.proxy_mpsc) {
+        reqs.proxyMpscQueueCount = args.nblocks;
+      } else {
+        reqs.proxySpscQueueCount =
+            args.nblocks *
+            ProxyUnitsPerBlock(args.put_scope, args.threads_per_block, ctx->device_warp_size);
+      }
+      reqs.proxyThreadCount = args.proxy_threads;
+    }
   }
 
   if (ccoDevCommCreate(ctx->comm, &reqs, &ctx->devComm) != 0) {
@@ -433,6 +482,12 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // The other PE's index within the LSA team.
     ctx->peer_lsa_rank = ctx->devComm.lsaRank ^ 1;
   } else {
+    if (args.transport == Transport::kProxy &&
+        ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues == 0) {
+      if (ctx->my_pe == 0) std::fprintf(stderr, "ccoProxy queues were not created\n");
+      PerfFinalize(ctx);
+      return 1;
+    }
     if (ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
       if (ctx->my_pe == 0) {
         std::fprintf(stderr,
@@ -456,6 +511,13 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     } else if (args.transport == Transport::kLsa) {
       std::printf("[cco-bench] transport = LSA  (intra-node P2P, flat-VA load/store; lsaSize=%d)\n",
                   ctx->devComm.lsaSize);
+    } else if (args.transport == Transport::kProxy) {
+      std::printf(
+          "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues, %d host proxy "
+          "threads; gdaConnType=%d)\n",
+          ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
+          args.proxy_mpsc ? "MPSC" : "SPSC", args.proxy_threads,
+          static_cast<int>(ctx->devComm.gdaConnType));
     } else {
       std::printf(
           "[cco-bench] transport = IBGDA (cross-node RDMA via ccoGda; gdaConnType=%d)\n"
@@ -512,13 +574,15 @@ void PerfResFree(PerfRes* res) {
   if (res->counter_d) HIP_RUNTIME_CHECK(hipFree(res->counter_d));
 }
 
-float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch) {
+float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch,
+                        const std::function<void()>& pre_timed) {
   if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
   launch(static_cast<int>(warmup));
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
+  if (pre_timed) pre_timed();
   HIP_RUNTIME_CHECK(hipEventRecord(res.start, nullptr));
   launch(static_cast<int>(iters));
   HIP_RUNTIME_CHECK(hipGetLastError());

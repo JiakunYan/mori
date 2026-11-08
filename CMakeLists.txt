@@ -69,6 +69,9 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(BUILD_CCO_PROXY
+       "Build ccoProxy, the cco host-proxy RDMA transport on the KIWI queue (ROCm only)"
+       OFF)
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
@@ -335,6 +338,28 @@ endif()
 
 if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
+endif()
+
+# ccoProxy runs on KIWI invoke (GPU-to-CPU callbacks over the KIWI queue),
+# fetched at a pinned commit. Set FETCHCONTENT_SOURCE_DIR_KIWI to build against a local checkout
+# instead (e.g. offline).
+if(BUILD_CCO_PROXY)
+  if(NOT USE_ROCM)
+    message(FATAL_ERROR "BUILD_CCO_PROXY=ON requires USE_ROCM=ON")
+  endif()
+  if(NOT BUILD_CCO)
+    message(FATAL_ERROR "BUILD_CCO_PROXY=ON requires BUILD_CCO=ON")
+  endif()
+  include(FetchContent)
+  FetchContent_Declare(
+    kiwi
+    GIT_REPOSITORY https://github.com/AMDResearch/kiwi.git
+    GIT_TAG d7bb0d1acdfdfacc974f5778502cb59dac446c1e)
+  # Only the queue library and the header-only invoke layer (KIWI::invoke): no
+  # apps, tests or benchmarks. Build it for mori's GPU targets.
+  set(KIWI_BUILD_INVOKE ON)
+  set(HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+  FetchContent_MakeAvailable(kiwi)
 endif()
 
 if(BUILD_CCO)

@@ -374,6 +374,33 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
+// ccoProxy context (host-proxy RDMA; see cco_proxy.hpp). Kernels invoke host
+// callbacks (KIWI invoke) with descriptors, keys already resolved (the same
+// iova=0 window addressing as GDA). A fixed set of host proxy threads polls the
+// queues and posts the RDMA work requests on host-created RC QPs, one
+// per (proxy thread, peer). Two queue pools: SPSC (one wavefront at a time per
+// queue) and MPSC. Empty when both pools are empty.
+//
+// Each pool is one KIWI invoke context; its device context is opaque here so
+// this header stays free of KIWI headers (cco_proxy.hpp casts it back).
+struct ccoProxyContext {
+  int numSpscQueues;
+  int numMpscQueues;
+  void* spscContext;  // GPU kiwi::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC queues
+  void* mpscContext;  // GPU kiwi::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC queues
+  // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
+  // proxy has satisfied per queue. Fine-grained device memory, written only by
+  // the proxy, never decreases.
+  uint64_t* flushDone;
+  // [numMpscQueues] flush tickets taken per MPSC queue. Device memory, written
+  // only by kernels (atomic fetch-add), never decreases.
+  uint64_t* flushTicket;
+  // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
+  // max_msg_sz of any rank's port. put() splits larger transfers.
+  uint64_t maxPutBytes;
+  void* engine;  // host-only ccoProxyEngine*, opaque to kernels
+};
+
 struct ccoDevComm {
   // World / topology
   int rank;
@@ -413,6 +440,8 @@ struct ccoDevComm {
   ccoGdaBarrierHandle hybridRailGdaBarrier;
   // SDMA context (signal pool); empty when SDMA not materialized.
   ccoSdmaContext sdma;
+  // ccoProxy context (host-proxy RDMA); empty when no proxy queues are requested.
+  ccoProxyContext proxy;
 };
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
@@ -487,6 +516,23 @@ struct ccoDevCommRequirements {
   // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
+
+  // ccoProxy (host-proxy RDMA, needs a BUILD_CCO_PROXY build). Separate SPSC and
+  // MPSC queue pools (ccoProxy<SPSCD2HQueue> / ccoProxy<MPSCD2HQueue> index their
+  // own pool), polled by proxyThreadCount host threads. Uses the GDA peer set and
+  // signal slots, so gdaConnectionType must resolve to non-NONE. Every rank must
+  // pass the same queue and thread counts (checked; creation fails otherwise),
+  // and the GPU's VRAM must be host-mapped (large BAR). Each DevComm with proxy
+  // queues starts its own busy-polling threads, pinned by the same policy
+  // (MORI_CCO_PROXY_CPUS or the GPU-local cores), so several such DevComms
+  // oversubscribe the same CPUs; prefer one per comm.
+  int proxySpscQueueCount;  // 0 = no SPSC pool
+  int proxyMpscQueueCount;  // 0 = no MPSC pool
+  int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
+  int proxyQueueCapacity;   // ring capacity in 64-byte lines (power of two); 0 = default.
+                            // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
+                            // lines per active lane (128 for a full wavefront of
+                            // put+signal); smaller rings trap.
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -505,6 +551,10 @@ struct ccoDevCommRequirements {
       0,                                         /* railGdaBarrierCount*/       \
       0,                                         /* sdmaQueueCount     */       \
       0,                                         /* barrierCount       */       \
+      0,                                         /* proxySpscQueueCount*/       \
+      0,                                         /* proxyMpscQueueCount*/       \
+      0,                                         /* proxyThreadCount   */       \
+      0,                                         /* proxyQueueCapacity */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -914,6 +964,10 @@ struct ccoComm {
 
   std::vector<ccoWindowHost*> windows;
 
+  // Live ccoProxy engines (ccoProxyEngine*, one per DevComm with proxy queues),
+  // so ccoCommDestroy can stop any whose DevComm was never destroyed.
+  std::vector<void*> proxyEngines;
+
   struct WindowTableEntry {
     uintptr_t base;
     uintptr_t size;
@@ -951,6 +1005,9 @@ struct ccoUniqueId {
 int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
+// Destroy every DevComm first. A DevComm with ccoProxy queues left alive is
+// warned about and its proxy engine stopped here (collectively, as in
+// ccoDevCommDestroy); its other device resources are leaked.
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
@@ -993,7 +1050,8 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // outDevComm is a caller-provided host struct filled in place (it holds device
 // pointers but lives on the host). Pass it by value into kernels — it lands in
 // kernel-arg space, no per-access GPU-memory dereference. The device resources
-// it references are released by ccoDevCommDestroy(comm, &devComm).
+// it references are released by ccoDevCommDestroy(comm, &devComm), which is
+// collective when the DevComm has ccoProxy queues.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 

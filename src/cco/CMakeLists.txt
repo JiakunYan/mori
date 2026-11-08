@@ -30,6 +30,22 @@ target_link_options(mori_cco PRIVATE LINKER:--exclude-libs,ALL)
 
 target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
 
+# ccoProxy (host-proxy RDMA over KIWI invoke). The engine TU is HIP because the
+# KIWI headers are. KIWI invoke is header-only on the KIWI queue library, which
+# is static and PIC, so it is absorbed like the application layer (its symbols
+# stay local via --exclude-libs). The KIWI headers are PUBLIC because
+# cco_proxy.hpp includes them; kiwi_queue_headers carries KIWI's include
+# directory, which holds the invoke headers too.
+# MORI_CCO_PROXY is PUBLIC so kernels including cco_proxy.hpp can tell the
+# transport was built in.
+if(BUILD_CCO_PROXY)
+  target_sources(mori_cco PRIVATE cco_proxy_engine.hip.cpp)
+  set_source_files_properties(cco_proxy_engine.hip.cpp PROPERTIES LANGUAGE HIP)
+  target_compile_definitions(mori_cco PUBLIC MORI_CCO_PROXY=1)
+  target_link_libraries(mori_cco PUBLIC kiwi_queue_headers PRIVATE KIWI::invoke)
+  set_target_properties(mori_cco PROPERTIES HIP_STANDARD 17)
+endif()
+
 set_target_properties(
   mori_cco
   PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
