@@ -60,8 +60,9 @@ of the queue complete.
   - `-S` is the same ping-pong with bare signals.
 - `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, wavefront with
   `-s warp`, or thread with `-s thread`) puts its slice every iteration, then
-  does one flush per launch, as ibgda does with `flush`. With `-s thread` each
-  wavefront pushes its 64 lanes' puts to its queue in one lane-masked push.
+  does one flush per launch, as ibgda does with `flush`. With `-s thread`
+  (`ccoCoopLaneMasked`) each wavefront pushes its 64 lanes' puts to its queue
+  in one lane-masked push.
   - `-q spsc` (default) gives every block (`-s block`) or wavefront its own
     SPSC queue; `-q mpsc` shares one MPSC queue per block.
   - `-Q` sets the number of host proxy threads (default 4).

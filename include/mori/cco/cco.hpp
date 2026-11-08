@@ -530,8 +530,9 @@ struct ccoDevCommRequirements {
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
   int proxyQueueCapacity;   // ring capacity in 64-byte lines (power of two); 0 = default.
-                            // ccoCoopThread ops need up to 2 lines per active lane (128
-                            // for a full wavefront of put+signal); smaller rings trap.
+                            // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
+                            // lines per active lane (128 for a full wavefront of
+                            // put+signal); smaller rings trap.
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \

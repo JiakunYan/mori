@@ -75,7 +75,7 @@
 //                  queue; MPSC: 4)
 //   split_warp     put_sig_warp with the put split size lowered to 4 KiB
 //                  (16 pieces per put)
-//   thr_*          ccoCoopThread, one wavefront per unit: lane L puts its own
+//   thr_*          ccoCoopLaneMasked, one wavefront per unit: lane L puts its own
 //                  offset and size (ThreadBytes(L), 4 B .. 1 KiB) and every
 //                  fifth lane is idle (active = false); with more than two
 //                  ranks the lanes of one call target different peers. A
@@ -88,7 +88,7 @@
 //                    1..4 pieces; idle lanes pass a valid put that must not be
 //                    issued
 //     thr_lane_sig   put, then a signal to a per-lane slot
-//     thr_flush      put, flush(ccoCoopThread) (SPSC: flushDone +1), each
+//     thr_flush      put, flush() from all lanes (SPSC: flushDone +1), each
 //                    lane overwrites its source, then SignalAdd{L + 1} to a
 //                    shared slot
 //                  thr_lane_sig and thr_flush idle lanes pass garbage
@@ -245,7 +245,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   }
 }
 
-// ccoCoopThread cases: one wavefront per block, block u = unit u on queue u
+// ccoCoopLaneMasked cases: one wavefront per block, block u = unit u on queue u
 // (MPSC: modulo the pool). Lane L owns kLaneSlice bytes at L * kLaneSlice of
 // the unit's chunk to every peer; if ThreadActive(L) it puts the first
 // ThreadBytes(L) of them, else the rest of its slice stays untouched.
@@ -316,10 +316,10 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
       if constexpr (Mode == kThreadPutSignal) {
         proxy.put(peer, dst, off(me, r), src, off(p, r), bytes,
                   ccoGda_SignalAdd{LaneSlot(n, me, u, lane), static_cast<uint64_t>(lane + 1)},
-                  ccoCoopThread{}, active);
+                  ccoCoopLaneMasked{active});
       } else {
-        proxy.put(peer, dst, off(me, r), src, off(p, r), bytes, ccoGda_NoSignal{}, ccoCoopThread{},
-                  active);
+        proxy.put(peer, dst, off(me, r), src, off(p, r), bytes, ccoGda_NoSignal{},
+                  ccoCoopLaneMasked{active});
       }
     }
   }
@@ -328,7 +328,7 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
     if constexpr (ccoProxy<Q>::kSpsc) {
       before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
-    proxy.flush(ccoCoopThread{});  // one flush for the wavefront
+    proxy.flush();  // one flush for the wavefront
     if constexpr (ccoProxy<Q>::kSpsc) {
       const uint64_t after =
           __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -349,10 +349,10 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
   for (int k = 0; k < n - 1; k++) {
     const int peer = garbage ? (1 << 20) : ThreadPeer(me, n, k, lane);
     if constexpr (Mode == kThreadPutLaneSignal) {
-      proxy.signal(peer, ccoGda_SignalInc{LaneSlot(n, me, u, lane)}, ccoCoopThread{}, active);
+      proxy.signal(peer, ccoGda_SignalInc{LaneSlot(n, me, u, lane)}, ccoCoopLaneMasked{active});
     } else if constexpr (Mode == kThreadPutFlush) {
       proxy.signal(peer, ccoGda_SignalAdd{Slot(me, u), static_cast<uint64_t>(lane + 1)},
-                   ccoCoopThread{}, active);
+                   ccoCoopLaneMasked{active});
     }
   }
   // Consume exactly what the senders' active lanes signalled (leftovers are
@@ -390,7 +390,7 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
   // Complete every work request before the kernel ends, so the checks after
   // the barrier see all this rank sent (including anything an idle lane might
   // wrongly have issued).
-  proxy.flush(ccoCoopThread{});
+  proxy.flush();
 }
 
 // Every signal slot must read 0: every signal sent was consumed by a wait.
@@ -579,7 +579,7 @@ struct Ctx {
     Sync();
   }
 
-  // laneSlices: the ccoCoopThread layout, where only the first ThreadBytes(L)
+  // laneSlices: the ccoCoopLaneMasked layout, where only the first ThreadBytes(L)
   // of an active lane L's slice are written and the rest keeps the fill.
   int Verify(const char* name, uint32_t salt, size_t chunk, int nUnits, bool laneSlices = false) {
     std::vector<uint32_t> host(bufSize / sizeof(uint32_t));
@@ -761,7 +761,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                                      kMaxUnits, 256);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "split_warp", 17, kChunk,
                                                              kSpscQueues, 64, false, 4096);
-  // ccoCoopThread: per-lane offsets, sizes and signals, idle lanes; 256-byte
+  // ccoCoopLaneMasked: per-lane offsets, sizes and signals, idle lanes; 256-byte
   // split pieces in the *_put_sig cases (lanes need 1 to 4 pieces).
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutSignal>(c, "thr_put_sig", 18, kSpscQueues, 256);
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutLaneSignal>(c, "thr_lane_sig", 19, kSpscQueues);
