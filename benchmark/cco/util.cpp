@@ -70,7 +70,8 @@ void PrintUsage(const char* program) {
                "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
                "  -Q threads     proxy: host proxy threads (default 4)\n"
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
-               "                 per wavefront with -s warp) | mpsc (one queue per block)\n"
+               "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
+               "                 block)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }

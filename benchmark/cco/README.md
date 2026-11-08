@@ -58,14 +58,15 @@ of the queue complete.
   - `-P` switches ibgda or proxy to a ping-pong: put + SignalInc, PE 1 echoes,
     and the reported value is round trip / 2.
   - `-S` is the same ping-pong with bare signals.
-- `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, or wavefront with
-  `-s warp`) puts its slice every iteration, then does one flush per launch,
-  as ibgda does with `flush`.
-  - `-q spsc` (default) gives every unit its own SPSC queue; `-q mpsc` shares
-    one MPSC queue per block.
+- `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, wavefront with
+  `-s warp`, or thread with `-s thread`) puts its slice every iteration, then
+  does one flush per launch, as ibgda does with `flush`. With `-s thread` each
+  wavefront pushes its 64 lanes' puts to its queue in one lane-masked push.
+  - `-q spsc` (default) gives every block (`-s block`) or wavefront its own
+    SPSC queue; `-q mpsc` shares one MPSC queue per block.
   - `-Q` sets the number of host proxy threads (default 4).
-- Message rate: run small sizes with `-s warp` and many wavefronts. The `Mpps`
-  column gives the per-message issue rate.
+- Message rate: run small sizes with `-s warp` or `-s thread` and many
+  wavefronts. The `Mpps` column gives the per-message issue rate.
 
 ```bash
 cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON -DBUILD_CCO_PROXY=ON
@@ -82,6 +83,8 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -Q 4 -c 32 -T 256 -s bloc
 # message rate: 32 blocks x 4 wavefronts = 128 SPSC queues, 8 B..4 KiB per message
 mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -Q 4 -c 32 -T 256 -s warp -b 1K -e 512K -n 2000
 mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -q mpsc -Q 4 -c 32 -T 256 -s warp -b 1K -e 512K -n 2000
+# per-thread puts: 64 per wavefront push, 8 B..1 KiB per message
+mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t proxy -Q 4 -c 32 -T 256 -s thread -b 64K -e 8M -n 200
 ```
 
 ## Triton benchmark

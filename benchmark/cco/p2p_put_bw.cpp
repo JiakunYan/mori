@@ -28,9 +28,9 @@
 //   -t proxy : one-sided RDMA write via ccoProxy (KIWI queue + -Q host proxy
 //              threads). Same split and completion as ibgda: each unit puts its
 //              slice every iteration, then flushes its queue.
-//              -q spsc: one queue per unit; -q mpsc: one queue per block.
-//              Small sizes with -s warp and many blocks give the message rate
-//              (Mpps column).
+//              -q spsc: one queue per unit (per wavefront with -s thread);
+//              -q mpsc: one queue per block. Small sizes with -s warp or
+//              -s thread and many blocks give the message rate (Mpps column).
 //
 // lsa/ibgda split the buffer into `nblocks` chunks (one per block); scope sets
 // the per-chunk cooperation granularity (block/warp/thread). sdma splits over
@@ -118,8 +118,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 #ifdef MORI_CCO_PROXY
 // Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
 // iteration, then a flush waits until its puts completed (remote ack) -- the
-// counterpart of ibgda's trailing flush. SPSC: unit u of block b owns
-// queue b * nunits + u; MPSC: the block's units share queue b.
+// counterpart of ibgda's trailing flush. SPSC: each issuing wavefront (block
+// with ccoCoopBlock) owns a queue, with ccoCoopThread one per wavefront of 64
+// units; MPSC: the block's units share queue b.
 template <typename Q, typename Coop>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
@@ -137,7 +138,10 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? bid * nunits + unit : bid};
+  const int qsize = std::is_same_v<Coop, ccoCoopThread> ? __builtin_amdgcn_wavefrontsize()
+                                                        : coop.size();  // threads per queue
+  const int nthreads = blockDim.x * blockDim.y * blockDim.z;
+  ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? bid * (nthreads / qsize) + tid / qsize : bid};
   for (int i = 0; i < iter; i++) {
     proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
               reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
@@ -150,6 +154,9 @@ static void launch_proxy(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
                          ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm, int count) {
   if (scope == PutScope::kWarp) {
     hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, count);
+  } else if (scope == PutScope::kThread) {
+    hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopThread>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
   } else {
     hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
@@ -289,8 +296,13 @@ int main(int argc, char** argv) {
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const bool proxy = args.transport == Transport::kProxy;
-  if (proxy && args.put_scope != PutScope::kWarp && args.put_scope != PutScope::kBlock) {
-    if (my_pe == 0) std::fprintf(stderr, "-t proxy needs -s warp|block\n");
+  // ccoCoopThread issues from whole wavefronts (a KIWI push is wavefront-collective).
+  if (proxy && (args.put_scope == PutScope::kThreadAgg ||
+                (args.put_scope == PutScope::kThread &&
+                 args.threads_per_block % ctx.device_warp_size != 0))) {
+    if (my_pe == 0) {
+      std::fprintf(stderr, "-t proxy needs -s thread|warp|block (thread: -T whole wavefronts)\n");
+    }
     PerfFinalize(&ctx);
     return 1;
   }
