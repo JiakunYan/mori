@@ -354,7 +354,7 @@ if(BUILD_CCO_PROXY)
   FetchContent_Declare(
     kiwi
     GIT_REPOSITORY https://github.com/AMDResearch/kiwi.git
-    GIT_TAG 89342e3870af2caa6836d009dcb98f9e0e78da29)
+    GIT_TAG d7bb0d1acdfdfacc974f5778502cb59dac446c1e)
   # Only the queue library and the header-only invoke layer (KIWI::invoke): no
   # apps, tests or benchmarks. Build it for mori's GPU targets.
   set(KIWI_BUILD_INVOKE ON)
